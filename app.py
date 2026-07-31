@@ -681,6 +681,237 @@ def api_users_delete(username):
     return jsonify({"status": "success", "message": f"User '{username}' deleted."})
 
 
+# ==========================================================================
+#  INSTANCE MANAGER (owner-only, main server only)
+#  Lets the owner create/start/stop/delete isolated instances (each on its
+#  own port with its own data) directly from the dashboard.
+# ==========================================================================
+INSTANCES_DIR = os.path.join(BASE_DIR, "instances")
+INSTANCES_REGISTRY = os.path.join(BASE_DIR, "instances.json")
+INSTANCE_CODE_FILES = ["app.py", "hero_sms_automation.py", "clean_unused_profiles.py",
+                       "analyze_recovery_times.py", "requirements.txt"]
+# The main server is the "manager". Child instances are spawned with HERO_CHILD=1
+# so they are plain worker dashboards and cannot spawn further instances.
+IS_MANAGER = os.environ.get("HERO_CHILD") != "1"
+try:
+    SELF_PORT = int(os.environ.get("HERO_PORT", "5000") or "5000")
+except ValueError:
+    SELF_PORT = 5000
+
+
+def load_instances():
+    if os.path.exists(INSTANCES_REGISTRY):
+        try:
+            with open(INSTANCES_REGISTRY, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return []
+
+
+def save_instances(items):
+    try:
+        with open(INSTANCES_REGISTRY, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+
+def _valid_instance_name(name):
+    return bool(re.match(r'^[A-Za-z0-9_-]{1,30}$', name or ''))
+
+
+def _port_alive(port):
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            s.connect(("127.0.0.1", int(port)))
+            return True
+    except Exception:
+        return False
+
+
+def _find_free_port(start=5001):
+    used = {int(i.get("port")) for i in load_instances() if i.get("port")}
+    used.add(SELF_PORT)
+    p = start
+    while p < 65535:
+        if p not in used and not _port_alive(p):
+            return p
+        p += 1
+    return None
+
+
+def _pid_on_port(port):
+    """Return the PID listening on the given TCP port (Windows/Unix netstat)."""
+    try:
+        out = subprocess.check_output("netstat -ano -p tcp", shell=True, text=True)
+    except Exception:
+        try:
+            out = subprocess.check_output("netstat -ano", shell=True, text=True)
+        except Exception:
+            return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0].upper().startswith("TCP") and parts[3].upper() == "LISTENING":
+            if parts[1].endswith(f":{port}"):
+                try:
+                    return int(parts[4])
+                except Exception:
+                    pass
+    return None
+
+
+def _kill_pid(pid):
+    try:
+        if sys.platform == 'win32':
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        else:
+            subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def _copy_code_to(dest):
+    import shutil
+    os.makedirs(dest, exist_ok=True)
+    for f in INSTANCE_CODE_FILES:
+        src = os.path.join(BASE_DIR, f)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest, os.path.basename(f)))
+
+
+def _spawn_instance(name, port):
+    dest = os.path.join(INSTANCES_DIR, name)
+    env = os.environ.copy()
+    env["HERO_CHILD"] = "1"           # mark as a worker (no instance manager)
+    env["HERO_PORT"] = str(port)
+    env.setdefault("HERO_HOST", os.environ.get("HERO_HOST", "127.0.0.1"))
+    flags = 0
+    if sys.platform == 'win32':
+        flags = subprocess.CREATE_NEW_CONSOLE
+    subprocess.Popen([sys.executable, "app.py", str(port)], cwd=dest, env=env, creationflags=flags)
+
+
+def manager_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not IS_MANAGER:
+            return jsonify({"status": "error", "message": "Instance management is only available on the main server."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/api/instances', methods=['GET'])
+@owner_required
+@manager_required
+def api_instances_list():
+    result = []
+    for it in load_instances():
+        port = it.get("port")
+        result.append({
+            "name": it.get("name"),
+            "port": port,
+            "created_at": it.get("created_at", 0),
+            "running": _port_alive(port) if port else False,
+        })
+    return jsonify(result)
+
+
+@app.route('/api/instances', methods=['POST'])
+@owner_required
+@manager_required
+def api_instances_create():
+    data = request.json or {}
+    name = (data.get("name") or "").strip()
+    if not _valid_instance_name(name):
+        return jsonify({"status": "error", "message": "Name must be 1-30 chars: letters, numbers, - or _ only."}), 400
+    items = load_instances()
+    if any(i.get("name", "").lower() == name.lower() for i in items):
+        return jsonify({"status": "error", "message": "An instance with that name already exists."}), 400
+    port = data.get("port")
+    if port:
+        try:
+            port = int(port)
+        except Exception:
+            return jsonify({"status": "error", "message": "Port must be a number."}), 400
+        if port == SELF_PORT or any(int(i.get("port", 0)) == port for i in items) or _port_alive(port):
+            return jsonify({"status": "error", "message": "That port is already in use."}), 400
+    else:
+        port = _find_free_port()
+        if not port:
+            return jsonify({"status": "error", "message": "No free port available."}), 500
+    dest = os.path.join(INSTANCES_DIR, name)
+    try:
+        _copy_code_to(dest)
+        items.append({"name": name, "port": port, "created_at": int(time.time())})
+        save_instances(items)
+        _spawn_instance(name, port)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to create instance: {e}"}), 500
+    return jsonify({"status": "success", "message": f"Instance '{name}' created on port {port}.", "name": name, "port": port})
+
+
+@app.route('/api/instances/<name>/start', methods=['POST'])
+@owner_required
+@manager_required
+def api_instances_start(name):
+    it = next((i for i in load_instances() if i.get("name", "").lower() == name.lower()), None)
+    if not it:
+        return jsonify({"status": "error", "message": "Instance not found."}), 404
+    port = it.get("port")
+    if _port_alive(port):
+        return jsonify({"status": "success", "message": "Instance is already running."})
+    dest = os.path.join(INSTANCES_DIR, it["name"])
+    if not os.path.exists(os.path.join(dest, "app.py")):
+        _copy_code_to(dest)
+    _spawn_instance(it["name"], port)
+    return jsonify({"status": "success", "message": f"Instance '{it['name']}' starting on port {port}."})
+
+
+@app.route('/api/instances/<name>/stop', methods=['POST'])
+@owner_required
+@manager_required
+def api_instances_stop(name):
+    it = next((i for i in load_instances() if i.get("name", "").lower() == name.lower()), None)
+    if not it:
+        return jsonify({"status": "error", "message": "Instance not found."}), 404
+    pid = _pid_on_port(it.get("port"))
+    if not pid:
+        return jsonify({"status": "success", "message": "Instance was not running."})
+    if not _kill_pid(pid):
+        return jsonify({"status": "error", "message": "Failed to stop instance."}), 500
+    return jsonify({"status": "success", "message": f"Instance '{it['name']}' stopped."})
+
+
+@app.route('/api/instances/<name>', methods=['DELETE'])
+@owner_required
+@manager_required
+def api_instances_delete(name):
+    import shutil
+    items = load_instances()
+    it = next((i for i in items if i.get("name", "").lower() == name.lower()), None)
+    if not it:
+        return jsonify({"status": "error", "message": "Instance not found."}), 404
+    pid = _pid_on_port(it.get("port"))
+    if pid:
+        _kill_pid(pid)
+    dest = os.path.join(INSTANCES_DIR, it["name"])
+    try:
+        if os.path.exists(dest):
+            shutil.rmtree(dest, ignore_errors=True)
+    except Exception:
+        pass
+    items = [i for i in items if i.get("name", "").lower() != name.lower()]
+    save_instances(items)
+    return jsonify({"status": "success", "message": f"Instance '{it['name']}' deleted."})
+
+
 @app.route('/')
 def index():
     # Render UI using render_template_string for single-file delivery
@@ -691,6 +922,7 @@ def index():
         current_username=user["username"],
         is_admin=is_admin(user),
         is_owner=is_owner(user),
+        is_manager=IS_MANAGER,
     )
 
 
@@ -1896,6 +2128,12 @@ HTML_TEMPLATE = """
                 <span id="serviceBtnLabel">Service</span>
             </button>
             {% endif %}
+            {% if is_owner and is_manager %}
+            <button onclick="openInstancesModal()" class="header-btn" title="Create and manage separate isolated instances">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2z"/></svg>
+                Instances
+            </button>
+            {% endif %}
             {% if is_admin %}
             <button onclick="openUsersModal()" class="header-btn" title="Manage users">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 10-4-4 4 4 0 004 4zm6 0a3 3 0 10-3-3"/></svg>
@@ -1930,6 +2168,32 @@ HTML_TEMPLATE = """
                 <table class="users-table">
                     <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody id="users_tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== Isolated instances modal (owner) ===== -->
+    <div id="instancesModal" class="modal-overlay" onclick="if(event.target===this)closeInstancesModal()">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>Isolated Instances</h2>
+                <button class="modal-close" onclick="closeInstancesModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:0.8rem;">
+                    Each instance is a fully separate server on its own port, with its own login accounts,
+                    Chrome/Facebook sessions, bot and results. Give one instance to each person.
+                </p>
+                <div class="user-create-row" style="grid-template-columns: 1fr 130px auto;">
+                    <input type="text" id="ni_name" placeholder="Instance name (e.g. client1)">
+                    <input type="text" id="ni_port" placeholder="Port (auto)">
+                    <button onclick="createInstance()" class="btn-primary">Create &amp; Start</button>
+                </div>
+                <div id="instances_msg" class="modal-msg"></div>
+                <table class="users-table">
+                    <thead><tr><th>Name</th><th>Port</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody id="instances_tbody"></tbody>
                 </table>
             </div>
         </div>
@@ -2233,6 +2497,86 @@ HTML_TEMPLATE = """
                 refreshServiceButton();
                 if (typeof showToast === 'function') showToast(d.message, d.status === 'success' ? 'success' : 'error');
             });
+        }
+
+        // ===== Owner: isolated instance manager =====
+        function openInstancesModal() {
+            document.getElementById('instancesModal').classList.add('open');
+            loadInstances();
+        }
+        function closeInstancesModal() {
+            document.getElementById('instancesModal').classList.remove('open');
+        }
+        function setInstancesMsg(text, ok) {
+            const el = document.getElementById('instances_msg');
+            el.textContent = text || '';
+            el.className = 'modal-msg ' + (text ? (ok ? 'ok' : 'err') : '');
+        }
+        function loadInstances() {
+            fetch('/api/instances').then(r => r.json()).then(list => {
+                const tb = document.getElementById('instances_tbody');
+                tb.innerHTML = '';
+                if (!list.length) {
+                    tb.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);">No instances yet. Create one above.</td></tr>';
+                    return;
+                }
+                list.forEach(it => {
+                    const tr = document.createElement('tr');
+                    const status = it.running
+                        ? '<span class="badge badge-on">Running</span>'
+                        : '<span class="badge badge-off">Stopped</span>';
+                    const openBtn = it.running
+                        ? '<button class="row-action" onclick="openInstance(' + it.port + ')">Open</button>'
+                        : '';
+                    const startStop = it.running
+                        ? '<button class="row-action" onclick="stopInstance(\\'' + it.name + '\\')">Stop</button>'
+                        : '<button class="row-action" onclick="startInstance(\\'' + it.name + '\\')">Start</button>';
+                    tr.innerHTML =
+                        '<td>' + it.name + '</td>' +
+                        '<td>' + it.port + '</td>' +
+                        '<td>' + status + '</td>' +
+                        '<td>' + openBtn + startStop +
+                            '<button class="row-action danger" onclick="deleteInstance(\\'' + it.name + '\\')">Delete</button>' +
+                        '</td>';
+                    tb.appendChild(tr);
+                });
+            }).catch(() => setInstancesMsg('Failed to load instances.', false));
+        }
+        function openInstance(port) {
+            window.open(location.protocol + '//' + location.hostname + ':' + port + '/', '_blank');
+        }
+        function createInstance() {
+            const name = document.getElementById('ni_name').value.trim();
+            const port = document.getElementById('ni_port').value.trim();
+            if (!name) { setInstancesMsg('Enter an instance name.', false); return; }
+            setInstancesMsg('Creating instance...', true);
+            const body = { name };
+            if (port) body.port = port;
+            fetch('/api/instances', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            }).then(r => r.json()).then(d => {
+                setInstancesMsg(d.message, d.status === 'success');
+                if (d.status === 'success') {
+                    document.getElementById('ni_name').value = '';
+                    document.getElementById('ni_port').value = '';
+                    setTimeout(loadInstances, 1500);
+                }
+            });
+        }
+        function startInstance(name) {
+            fetch('/api/instances/' + encodeURIComponent(name) + '/start', {method: 'POST'})
+                .then(r => r.json()).then(d => { setInstancesMsg(d.message, d.status === 'success'); setTimeout(loadInstances, 1500); });
+        }
+        function stopInstance(name) {
+            fetch('/api/instances/' + encodeURIComponent(name) + '/stop', {method: 'POST'})
+                .then(r => r.json()).then(d => { setInstancesMsg(d.message, d.status === 'success'); setTimeout(loadInstances, 800); });
+        }
+        function deleteInstance(name) {
+            if (!confirm('Delete instance "' + name + '"? Its accounts, config and results are permanently removed.')) return;
+            fetch('/api/instances/' + encodeURIComponent(name), {method: 'DELETE'})
+                .then(r => r.json()).then(d => { setInstancesMsg(d.message, d.status === 'success'); loadInstances(); });
         }
 
         // ===== Auth: user management + password modals =====
