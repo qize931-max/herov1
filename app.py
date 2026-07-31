@@ -2048,6 +2048,16 @@ HTML_TEMPLATE = """
         #serviceBtn.svc-locked { border-color: rgba(239,68,68,0.6); color: #fca5a5; background: rgba(239,68,68,0.12); }
         #serviceBtn.svc-locked:hover { background: rgba(239,68,68,0.2); }
         .badge-owner { background: rgba(245,158,11,0.18); color: #fcd34d; }
+        /* Show/hide password toggle */
+        .pw-wrap { position: relative; display: flex; align-items: center; }
+        .pw-wrap > input { width: 100%; padding-right: 4rem; }
+        .pw-toggle {
+            position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+            background: rgba(255,255,255,0.06); border: 1px solid var(--border-color);
+            color: var(--text-muted); font-family: var(--font-main); font-size: 0.72rem;
+            padding: 0.25rem 0.55rem; border-radius: 6px; cursor: pointer; line-height: 1;
+        }
+        .pw-toggle:hover { color: var(--text-main); border-color: var(--primary-glow); }
         .modal-overlay {
             display: none;
             position: fixed; inset: 0;
@@ -2277,7 +2287,10 @@ HTML_TEMPLATE = """
 
             <div class="input-group">
                 <label>New Account Password</label>
-                <input type="password" id="new_password" placeholder="HeroSmsRecover123!">
+                <div class="pw-wrap">
+                    <input type="password" id="new_password" placeholder="HeroSmsRecover123!">
+                    <button type="button" class="pw-toggle" onclick="togglePw('new_password', this)" title="Show/hide password" aria-label="Show or hide password">Show</button>
+                </div>
             </div>
 
             <div class="input-group">
@@ -2305,7 +2318,10 @@ HTML_TEMPLATE = """
                     </div>
                     <div class="input-group">
                         <label style="font-size: 0.75rem;">Hero SMS Password</label>
-                        <input type="password" id="hero_password" placeholder="••••••••">
+                        <div class="pw-wrap">
+                            <input type="password" id="hero_password" placeholder="••••••••">
+                            <button type="button" class="pw-toggle" onclick="togglePw('hero_password', this)" title="Show/hide password" aria-label="Show or hide password">Show</button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2497,6 +2513,14 @@ HTML_TEMPLATE = """
                 refreshServiceButton();
                 if (typeof showToast === 'function') showToast(d.message, d.status === 'success' ? 'success' : 'error');
             });
+        }
+
+        // ===== Show/hide password fields =====
+        function togglePw(id, btn) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el.type === 'password') { el.type = 'text'; btn.textContent = 'Hide'; }
+            else { el.type = 'password'; btn.textContent = 'Show'; }
         }
 
         // ===== Owner: isolated instance manager =====
