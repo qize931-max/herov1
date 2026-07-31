@@ -20,6 +20,9 @@ thread = None
 is_running = False
 session_start_time = None
 session_stop_requested_time = None
+# Chrome processes launched by THIS instance (so "Kill Chrome" only affects
+# this instance, not other isolated instances running on the same machine)
+launched_chrome_pids = []
 
 # Location of config and output files
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -958,8 +961,13 @@ def api_launch_chrome():
             creation_flags = subprocess.CREATE_NEW_CONSOLE
             
         # Launch Chrome detached
-        subprocess.Popen(cmd, creationflags=creation_flags)
-        
+        chrome_proc = subprocess.Popen(cmd, creationflags=creation_flags)
+        # Remember this instance's Chrome so kill_chrome stays instance-scoped
+        try:
+            launched_chrome_pids.append(chrome_proc.pid)
+        except Exception:
+            pass
+
         # Auto update config.json
         config = load_config_data()
         config["chrome_debug_url"] = f"http://127.0.0.1:{port}"
@@ -979,13 +987,25 @@ def api_launch_chrome():
 
 @app.route('/api/kill_chrome', methods=['POST'])
 def api_kill_chrome():
+    """Kill only the Chrome processes THIS instance launched, so isolated
+    instances on the same machine don't terminate each other's browser."""
     try:
         import subprocess
-        if sys.platform == 'win32':
-            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe"], capture_output=True)
-        else:
-            subprocess.run(["pkill", "-f", "chrome"], capture_output=True)
-        return jsonify({"status": "success", "message": "All Chrome processes terminated successfully."})
+        global launched_chrome_pids
+        killed = 0
+        for pid in list(launched_chrome_pids):
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+                else:
+                    subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                killed += 1
+            except Exception:
+                pass
+        launched_chrome_pids = []
+        if killed:
+            return jsonify({"status": "success", "message": f"Closed {killed} Chrome window(s) launched by this instance."})
+        return jsonify({"status": "success", "message": "No Chrome launched by this instance was running."})
     except Exception as e:
         return jsonify({"status": "error", "message": f"Failed to terminate Chrome: {e}"}), 500
 

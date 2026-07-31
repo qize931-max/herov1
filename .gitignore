@@ -30,3 +30,6 @@ recovered_stats.json
 users.json
 secret.key
 service.json
+
+# Isolated per-person instances (created at runtime by new_instance)
+instances/
