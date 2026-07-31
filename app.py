@@ -1289,6 +1289,40 @@ def api_clear_accounts():
         return jsonify({"status": "error", "message": f"Failed to clear accounts: {e}"}), 500
 
 
+@app.route('/api/download_accounts', methods=['GET'])
+def api_download_accounts():
+    """Download recovered_accounts.txt (whole file, or only one day's session
+    when ?date=YYYY-MM-DD is given). Served to whoever is logged in, so each
+    instance only ever exposes its own recovered accounts."""
+    if not os.path.exists(ACCOUNTS_PATH):
+        return jsonify({"status": "error", "message": "No recovered accounts yet."}), 404
+    try:
+        with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Could not read file: {e}"}), 500
+
+    date = (request.args.get("date") or "").strip()
+    suffix = ""
+    if date:
+        # Keep only account blocks whose header date matches the selected day
+        blocks = content.split("--- Recovered Account")
+        kept = ["--- Recovered Account" + b for b in blocks
+                if b.strip() and date in (b.strip().splitlines() or [""])[0]]
+        content = "".join(kept)
+        suffix = "_" + date
+        if not content.strip():
+            return jsonify({"status": "error", "message": f"No accounts for {date}."}), 404
+
+    instance = os.path.basename(BASE_DIR) or "hero"
+    download_name = f"recovered_accounts_{instance}{suffix}.txt"
+    return Response(
+        content,
+        mimetype="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
 @app.route('/stream')
 def stream_logs():
     def generate():
@@ -2471,7 +2505,13 @@ HTML_TEMPLATE = """
                         </svg>
                     </span>
                 </div>
-                <button class="btn btn-secondary" style="width: auto; font-size: 0.8rem; padding: 0.5rem 1rem;" onclick="clearAccounts()">Clear History</button>
+                <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+                    <select id="session-select" onchange="onSessionSelect()" style="width: auto; font-size: 0.8rem; padding: 0.5rem 0.7rem; background: rgba(0,0,0,0.25); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-main); font-family: var(--font-main); outline: none;">
+                        <option value="">All sessions</option>
+                    </select>
+                    <button class="btn btn-primary" style="width: auto; font-size: 0.8rem; padding: 0.5rem 1rem;" onclick="downloadAccounts()" title="Download the recovered accounts file for the selected session">Download</button>
+                    <button class="btn btn-secondary" style="width: auto; font-size: 0.8rem; padding: 0.5rem 1rem;" onclick="clearAccounts()">Clear History</button>
+                </div>
             </div>
             
             <div class="table-container">
@@ -3068,7 +3108,35 @@ HTML_TEMPLATE = """
                 .then(data => {
                     accountsData = data;
                     renderAccounts();
+                    populateSessionDropdown();
                 });
+        }
+
+        function populateSessionDropdown() {
+            const sel = document.getElementById('session-select');
+            if (!sel) return;
+            const cur = sel.value;
+            const dates = [...new Set(accountsData.map(a => (a.date || '').slice(0, 10)).filter(Boolean))].sort().reverse();
+            sel.innerHTML = '<option value="">All sessions</option>' + dates.map(d => '<option value="' + d + '">' + d + '</option>').join('');
+            if (dates.includes(cur)) sel.value = cur;
+            else if (selectedDateFilter && dates.includes(selectedDateFilter)) sel.value = selectedDateFilter;
+        }
+
+        function onSessionSelect() {
+            const v = document.getElementById('session-select').value;
+            selectedDateFilter = v || null;
+            renderAccounts();
+        }
+
+        function downloadAccounts() {
+            if (!accountsData.length) { showToast('No recovered accounts to download yet.', 'danger'); return; }
+            const d = document.getElementById('session-select').value || '';
+            const url = '/api/download_accounts' + (d ? ('?date=' + encodeURIComponent(d)) : '');
+            const a = document.createElement('a');
+            a.href = url;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
         }
 
         function renderAccounts() {
