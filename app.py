@@ -6,7 +6,10 @@ import queue
 import subprocess
 import threading
 import time
-from flask import Flask, Response, jsonify, request, render_template_string
+import secrets
+from functools import wraps
+from flask import Flask, Response, jsonify, request, render_template_string, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
@@ -62,6 +65,119 @@ def save_config_data(data):
         return True
     except Exception:
         return False
+
+
+# ==========================================================================
+#  AUTHENTICATION / USER ACCOUNTS
+# ==========================================================================
+USERS_PATH = os.path.join(BASE_DIR, "users.json")
+SECRET_PATH = os.path.join(BASE_DIR, "secret.key")
+
+# Default admin account created on first run. Change the password after logging in.
+DEFAULT_ADMIN_USERNAME = "admin"
+DEFAULT_ADMIN_PASSWORD = "admin"
+
+
+def _load_or_create_secret():
+    """Persist a Flask secret key so login sessions survive server restarts."""
+    try:
+        if os.path.exists(SECRET_PATH):
+            with open(SECRET_PATH, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                return key
+        key = secrets.token_hex(32)
+        with open(SECRET_PATH, "w", encoding="utf-8") as f:
+            f.write(key)
+        return key
+    except Exception:
+        # Fall back to an in-memory key (sessions reset on restart)
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_or_create_secret()
+
+
+def load_users():
+    if os.path.exists(USERS_PATH):
+        try:
+            with open(USERS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("users"), list):
+                return data["users"]
+        except Exception:
+            pass
+    return []
+
+
+def save_users(users):
+    try:
+        with open(USERS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"users": users}, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+
+def find_user(username):
+    if not username:
+        return None
+    for u in load_users():
+        if u.get("username", "").lower() == username.lower():
+            return u
+    return None
+
+
+def ensure_default_admin():
+    """Seed a default admin account if no users exist yet."""
+    users = load_users()
+    if not users:
+        users.append({
+            "username": DEFAULT_ADMIN_USERNAME,
+            "password_hash": generate_password_hash(DEFAULT_ADMIN_PASSWORD),
+            "role": "admin",
+            "enabled": True,
+            "created_at": int(time.time()),
+        })
+        save_users(users)
+
+
+def current_user():
+    return find_user(session.get("username"))
+
+
+# Endpoints reachable without being logged in
+PUBLIC_ENDPOINTS = {"login", "logout", "static"}
+
+
+@app.before_request
+def require_login():
+    if request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    user = current_user()
+    if not user or not user.get("enabled", True):
+        session.clear()
+        if request.path.startswith("/api/") or request.path == "/stream":
+            return jsonify({"status": "error", "message": "Authentication required."}), 401
+        return redirect(url_for("login", next=request.path))
+    return None
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or not user.get("enabled", True):
+            session.clear()
+            return jsonify({"status": "error", "message": "Authentication required."}), 401
+        if user.get("role") != "admin":
+            return jsonify({"status": "error", "message": "Admin privileges required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# Create the default admin on startup
+ensure_default_admin()
 
 def parse_recovered_accounts():
     accounts = []
@@ -292,11 +408,161 @@ def run_automation_process():
         process = None
 
 
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    ensure_default_admin()
+    error = None
+    if request.method == 'POST':
+        username = (request.form.get('username') or '').strip()
+        password = request.form.get('password') or ''
+        user = find_user(username)
+        if not user or not check_password_hash(user.get('password_hash', ''), password):
+            error = "Invalid username or password."
+        elif not user.get('enabled', True):
+            error = "This account has been disabled. Contact an administrator."
+        else:
+            session.clear()
+            session['username'] = user['username']
+            nxt = request.args.get('next') or url_for('index')
+            # Only allow internal redirects
+            if not nxt.startswith('/'):
+                nxt = url_for('index')
+            return redirect(nxt)
+    return render_template_string(LOGIN_TEMPLATE, error=error)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route('/api/me', methods=['GET'])
+def api_me():
+    user = current_user()
+    return jsonify({
+        "username": user["username"],
+        "role": user.get("role", "user"),
+        "is_admin": user.get("role") == "admin",
+    })
+
+
+@app.route('/api/change_password', methods=['POST'])
+def api_change_password():
+    """Any logged-in user can change their own password."""
+    user = current_user()
+    data = request.json or {}
+    current_pw = data.get('current_password') or ''
+    new_pw = data.get('new_password') or ''
+    if not check_password_hash(user.get('password_hash', ''), current_pw):
+        return jsonify({"status": "error", "message": "Current password is incorrect."}), 400
+    if len(new_pw) < 4:
+        return jsonify({"status": "error", "message": "New password must be at least 4 characters."}), 400
+    users = load_users()
+    for u in users:
+        if u['username'].lower() == user['username'].lower():
+            u['password_hash'] = generate_password_hash(new_pw)
+            break
+    save_users(users)
+    return jsonify({"status": "success", "message": "Password updated."})
+
+
+@app.route('/api/users', methods=['GET'])
+@admin_required
+def api_users_list():
+    users = load_users()
+    return jsonify([
+        {
+            "username": u["username"],
+            "role": u.get("role", "user"),
+            "enabled": u.get("enabled", True),
+            "created_at": u.get("created_at", 0),
+        }
+        for u in users
+    ])
+
+
+@app.route('/api/users', methods=['POST'])
+@admin_required
+def api_users_create():
+    data = request.json or {}
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    role = data.get('role') or 'user'
+    if role not in ('user', 'admin'):
+        role = 'user'
+    if not username or not password:
+        return jsonify({"status": "error", "message": "Username and password are required."}), 400
+    if len(password) < 4:
+        return jsonify({"status": "error", "message": "Password must be at least 4 characters."}), 400
+    if find_user(username):
+        return jsonify({"status": "error", "message": "That username already exists."}), 400
+    users = load_users()
+    users.append({
+        "username": username,
+        "password_hash": generate_password_hash(password),
+        "role": role,
+        "enabled": True,
+        "created_at": int(time.time()),
+    })
+    save_users(users)
+    return jsonify({"status": "success", "message": f"User '{username}' created."})
+
+
+@app.route('/api/users/<username>/toggle', methods=['POST'])
+@admin_required
+def api_users_toggle(username):
+    me = current_user()
+    if username.lower() == me['username'].lower():
+        return jsonify({"status": "error", "message": "You cannot disable your own account."}), 400
+    users = load_users()
+    target = None
+    for u in users:
+        if u['username'].lower() == username.lower():
+            target = u
+            break
+    if not target:
+        return jsonify({"status": "error", "message": "User not found."}), 404
+    # Prevent disabling the last enabled admin
+    if target.get('role') == 'admin' and target.get('enabled', True):
+        enabled_admins = [u for u in users if u.get('role') == 'admin' and u.get('enabled', True)]
+        if len(enabled_admins) <= 1:
+            return jsonify({"status": "error", "message": "Cannot disable the last active admin."}), 400
+    target['enabled'] = not target.get('enabled', True)
+    save_users(users)
+    state = "enabled" if target['enabled'] else "disabled"
+    return jsonify({"status": "success", "message": f"User '{username}' {state}.", "enabled": target['enabled']})
+
+
+@app.route('/api/users/<username>', methods=['DELETE'])
+@admin_required
+def api_users_delete(username):
+    me = current_user()
+    if username.lower() == me['username'].lower():
+        return jsonify({"status": "error", "message": "You cannot delete your own account."}), 400
+    users = load_users()
+    target = next((u for u in users if u['username'].lower() == username.lower()), None)
+    if not target:
+        return jsonify({"status": "error", "message": "User not found."}), 404
+    if target.get('role') == 'admin':
+        enabled_admins = [u for u in users if u.get('role') == 'admin' and u.get('enabled', True)]
+        if target.get('enabled', True) and len(enabled_admins) <= 1:
+            return jsonify({"status": "error", "message": "Cannot delete the last active admin."}), 400
+    users = [u for u in users if u['username'].lower() != username.lower()]
+    save_users(users)
+    return jsonify({"status": "success", "message": f"User '{username}' deleted."})
+
+
 @app.route('/')
 def index():
     # Render UI using render_template_string for single-file delivery
     # Keep standard template outside Flask logic or inside, since we have template_html
-    return render_template_string(HTML_TEMPLATE)
+    user = current_user()
+    return render_template_string(
+        HTML_TEMPLATE,
+        current_username=user["username"],
+        is_admin=(user.get("role") == "admin"),
+    )
 
 
 @app.route('/api/config', methods=['GET', 'POST'])
@@ -654,6 +920,118 @@ def stream_logs():
             except queue.Empty:
                 yield "data: [PING]\n\n"
     return Response(generate(), mimetype='text/event-stream')
+
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in - Hero SMS Automation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --container-bg: rgba(17, 24, 39, 0.7);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --primary-glow: #6366f1;
+            --primary-glow-hover: #4f46e5;
+            --danger-color: #ef4444;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --font-main: 'Outfit', sans-serif;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: var(--font-main);
+            background: var(--bg-color);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-image: radial-gradient(circle at 20% 20%, rgba(99,102,241,0.15), transparent 40%),
+                              radial-gradient(circle at 80% 80%, rgba(16,185,129,0.10), transparent 40%);
+        }
+        .login-card {
+            width: 100%;
+            max-width: 380px;
+            background: var(--container-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 18px;
+            padding: 2.5rem 2rem;
+            backdrop-filter: blur(14px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+        }
+        .login-logo {
+            display: flex; align-items: center; gap: 0.6rem;
+            justify-content: center; margin-bottom: 0.4rem;
+        }
+        .login-logo svg { width: 34px; height: 34px; fill: var(--primary-glow); }
+        .login-logo span { font-size: 1.25rem; font-weight: 600; }
+        .login-sub { text-align: center; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.8rem; }
+        label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.35rem; }
+        input {
+            width: 100%;
+            padding: 0.7rem 0.9rem;
+            margin-bottom: 1.1rem;
+            background: rgba(0,0,0,0.25);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            color: var(--text-main);
+            font-family: var(--font-main);
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color .15s;
+        }
+        input:focus { border-color: var(--primary-glow); }
+        button {
+            width: 100%;
+            padding: 0.75rem;
+            background: var(--primary-glow);
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            font-family: var(--font-main);
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background .15s;
+        }
+        button:hover { background: var(--primary-glow-hover); }
+        .error {
+            background: rgba(239,68,68,0.12);
+            border: 1px solid rgba(239,68,68,0.4);
+            color: #fca5a5;
+            padding: 0.6rem 0.8rem;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            margin-bottom: 1.2rem;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <div class="login-logo">
+            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+            <span>Hero SMS Automation</span>
+        </div>
+        <div class="login-sub">Sign in to continue</div>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" autocomplete="username" autofocus required>
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+            <button type="submit">Sign In</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
 
 
 HTML_TEMPLATE = """
@@ -1260,6 +1638,79 @@ HTML_TEMPLATE = """
         #stats-grid::-webkit-scrollbar-thumb:hover {
             background: rgba(255, 255, 255, 0.2);
         }
+
+        /* ===== Auth: header buttons + modals ===== */
+        .header-btn {
+            display: inline-flex; align-items: center; gap: 0.4rem;
+            padding: 0.45rem 0.8rem;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            color: var(--text-main);
+            font-family: var(--font-main);
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background .15s, border-color .15s;
+        }
+        .header-btn:hover { background: rgba(99,102,241,0.18); border-color: var(--primary-glow); }
+        .modal-overlay {
+            display: none;
+            position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            align-items: center; justify-content: center;
+        }
+        .modal-overlay.open { display: flex; }
+        .modal-box {
+            width: 100%; max-width: 620px;
+            max-height: 85vh; overflow-y: auto;
+            background: #111827;
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            box-shadow: 0 24px 70px rgba(0,0,0,0.55);
+        }
+        .modal-header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 1.1rem 1.4rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .modal-header h2 { font-size: 1.1rem; font-weight: 600; }
+        .modal-close { background: none; border: none; color: var(--text-muted); font-size: 1.6rem; line-height: 1; cursor: pointer; }
+        .modal-close:hover { color: var(--text-main); }
+        .modal-body { padding: 1.2rem 1.4rem; }
+        .modal-input {
+            width: 100%; padding: 0.6rem 0.8rem; margin: 0.3rem 0 0.9rem;
+            background: rgba(0,0,0,0.25); border: 1px solid var(--border-color);
+            border-radius: 8px; color: var(--text-main); font-family: var(--font-main); outline: none;
+        }
+        .modal-input:focus { border-color: var(--primary-glow); }
+        .user-create-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 0.5rem; margin-bottom: 1rem; }
+        .user-create-row input, .user-create-row select {
+            padding: 0.55rem 0.7rem; background: rgba(0,0,0,0.25);
+            border: 1px solid var(--border-color); border-radius: 8px;
+            color: var(--text-main); font-family: var(--font-main); outline: none;
+        }
+        .btn-primary {
+            padding: 0.55rem 1rem; background: var(--primary-glow); color: #fff;
+            border: none; border-radius: 8px; font-family: var(--font-main);
+            font-weight: 600; cursor: pointer; transition: background .15s;
+        }
+        .btn-primary:hover { background: var(--primary-glow-hover); }
+        .users-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+        .users-table th, .users-table td { text-align: left; padding: 0.6rem 0.5rem; border-bottom: 1px solid var(--border-color); }
+        .users-table th { color: var(--text-muted); font-weight: 500; }
+        .badge { padding: 0.15rem 0.55rem; border-radius: 999px; font-size: 0.72rem; font-weight: 600; }
+        .badge-admin { background: rgba(99,102,241,0.18); color: #a5b4fc; }
+        .badge-user { background: rgba(255,255,255,0.08); color: var(--text-muted); }
+        .badge-on { background: rgba(16,185,129,0.15); color: #6ee7b7; }
+        .badge-off { background: rgba(239,68,68,0.15); color: #fca5a5; }
+        .row-action { background: none; border: 1px solid var(--border-color); color: var(--text-main); padding: 0.3rem 0.6rem; border-radius: 7px; cursor: pointer; font-size: 0.78rem; margin-right: 0.3rem; }
+        .row-action:hover { border-color: var(--primary-glow); }
+        .row-action.danger:hover { border-color: var(--danger-color); color: #fca5a5; }
+        .modal-msg { font-size: 0.82rem; min-height: 1.1rem; margin-bottom: 0.6rem; }
+        .modal-msg.ok { color: #6ee7b7; }
+        .modal-msg.err { color: #fca5a5; }
     </style>
 </head>
 <body>
@@ -1272,11 +1723,67 @@ HTML_TEMPLATE = """
             </div>
             <div class="logo-text">Hero SMS Automation</div>
         </div>
-        <div class="status-badge">
-            <div class="status-dot" id="status-dot"></div>
-            <span id="status-text">Idle</span>
+        <div style="display:flex; align-items:center; gap:0.75rem;">
+            <div class="status-badge">
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Idle</span>
+            </div>
+            {% if is_admin %}
+            <button onclick="openUsersModal()" class="header-btn" title="Manage users">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 10-4-4 4 4 0 004 4zm6 0a3 3 0 10-3-3"/></svg>
+                Users
+            </button>
+            {% endif %}
+            <button onclick="openPasswordModal()" class="header-btn" title="Change your password">{{ current_username }}</button>
+            <a href="/logout" class="header-btn" title="Sign out" style="text-decoration:none;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+            </a>
         </div>
     </header>
+
+    <!-- ===== User management modal (admin) ===== -->
+    <div id="usersModal" class="modal-overlay" onclick="if(event.target===this)closeUsersModal()">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>User Accounts</h2>
+                <button class="modal-close" onclick="closeUsersModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="user-create-row">
+                    <input type="text" id="nu_username" placeholder="Username">
+                    <input type="password" id="nu_password" placeholder="Password">
+                    <select id="nu_role">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                    <button onclick="createUser()" class="btn-primary">Add</button>
+                </div>
+                <div id="users_msg" class="modal-msg"></div>
+                <table class="users-table">
+                    <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+                    <tbody id="users_tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== Change password modal ===== -->
+    <div id="passwordModal" class="modal-overlay" onclick="if(event.target===this)closePasswordModal()">
+        <div class="modal-box" style="max-width:380px;">
+            <div class="modal-header">
+                <h2>Change Password</h2>
+                <button class="modal-close" onclick="closePasswordModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <label style="font-size:0.8rem;color:var(--text-muted);">Current password</label>
+                <input type="password" id="pw_current" class="modal-input" placeholder="Current password">
+                <label style="font-size:0.8rem;color:var(--text-muted);">New password</label>
+                <input type="password" id="pw_new" class="modal-input" placeholder="New password">
+                <div id="pw_msg" class="modal-msg"></div>
+                <button onclick="changePassword()" class="btn-primary" style="width:100%;margin-top:0.5rem;">Update Password</button>
+            </div>
+        </div>
+    </div>
 
     <div class="main-container">
         <!-- Configuration panel -->
@@ -1524,6 +2031,102 @@ HTML_TEMPLATE = """
 
     <script>
         let eventSource = null;
+
+        // ===== Auth: user management + password modals =====
+        function openUsersModal() {
+            document.getElementById('usersModal').classList.add('open');
+            loadUsers();
+        }
+        function closeUsersModal() {
+            document.getElementById('usersModal').classList.remove('open');
+        }
+        function setUsersMsg(text, ok) {
+            const el = document.getElementById('users_msg');
+            el.textContent = text || '';
+            el.className = 'modal-msg ' + (text ? (ok ? 'ok' : 'err') : '');
+        }
+        function loadUsers() {
+            fetch('/api/users').then(r => r.json()).then(users => {
+                const tb = document.getElementById('users_tbody');
+                tb.innerHTML = '';
+                users.forEach(u => {
+                    const tr = document.createElement('tr');
+                    const roleBadge = u.role === 'admin'
+                        ? '<span class="badge badge-admin">Admin</span>'
+                        : '<span class="badge badge-user">User</span>';
+                    const statusBadge = u.enabled
+                        ? '<span class="badge badge-on">Active</span>'
+                        : '<span class="badge badge-off">Disabled</span>';
+                    const toggleLabel = u.enabled ? 'Disable' : 'Enable';
+                    tr.innerHTML =
+                        '<td>' + u.username + '</td>' +
+                        '<td>' + roleBadge + '</td>' +
+                        '<td>' + statusBadge + '</td>' +
+                        '<td>' +
+                            '<button class="row-action" onclick="toggleUser(\\'' + u.username + '\\')">' + toggleLabel + '</button>' +
+                            '<button class="row-action danger" onclick="deleteUser(\\'' + u.username + '\\')">Delete</button>' +
+                        '</td>';
+                    tb.appendChild(tr);
+                });
+            }).catch(() => setUsersMsg('Failed to load users.', false));
+        }
+        function createUser() {
+            const username = document.getElementById('nu_username').value.trim();
+            const password = document.getElementById('nu_password').value;
+            const role = document.getElementById('nu_role').value;
+            if (!username || !password) { setUsersMsg('Username and password required.', false); return; }
+            fetch('/api/users', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username, password, role})
+            }).then(r => r.json()).then(d => {
+                if (d.status === 'success') {
+                    setUsersMsg(d.message, true);
+                    document.getElementById('nu_username').value = '';
+                    document.getElementById('nu_password').value = '';
+                    loadUsers();
+                } else { setUsersMsg(d.message, false); }
+            });
+        }
+        function toggleUser(username) {
+            fetch('/api/users/' + encodeURIComponent(username) + '/toggle', {method: 'POST'})
+                .then(r => r.json()).then(d => {
+                    setUsersMsg(d.message, d.status === 'success');
+                    loadUsers();
+                });
+        }
+        function deleteUser(username) {
+            if (!confirm('Delete user "' + username + '"? This cannot be undone.')) return;
+            fetch('/api/users/' + encodeURIComponent(username), {method: 'DELETE'})
+                .then(r => r.json()).then(d => {
+                    setUsersMsg(d.message, d.status === 'success');
+                    loadUsers();
+                });
+        }
+        function openPasswordModal() {
+            document.getElementById('passwordModal').classList.add('open');
+            document.getElementById('pw_msg').textContent = '';
+        }
+        function closePasswordModal() {
+            document.getElementById('passwordModal').classList.remove('open');
+        }
+        function changePassword() {
+            const cur = document.getElementById('pw_current').value;
+            const nw = document.getElementById('pw_new').value;
+            const el = document.getElementById('pw_msg');
+            fetch('/api/change_password', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({current_password: cur, new_password: nw})
+            }).then(r => r.json()).then(d => {
+                el.className = 'modal-msg ' + (d.status === 'success' ? 'ok' : 'err');
+                el.textContent = d.message;
+                if (d.status === 'success') {
+                    document.getElementById('pw_current').value = '';
+                    document.getElementById('pw_new').value = '';
+                }
+            });
+        }
 
         // On Page Load
         window.addEventListener('load', () => {

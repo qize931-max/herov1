@@ -25,3 +25,7 @@ __pycache__/
 config.json
 recovered_accounts.txt
 recovered_stats.json
+
+# Auth: login accounts (hashed) + Flask session secret — never commit
+users.json
+secret.key
