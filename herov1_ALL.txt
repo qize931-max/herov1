@@ -212,6 +212,22 @@ def _load_or_create_secret():
 
 app.secret_key = _load_or_create_secret()
 
+# Session cookie hardening (matters once this is exposed to a network).
+# SESSION_COOKIE_SECURE is enabled automatically when served over HTTPS
+# (set HERO_HTTPS=1, e.g. when behind an HTTPS reverse proxy).
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=(os.environ.get("HERO_HTTPS", "").lower() in ("1", "true", "yes")),
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,  # 12 hours
+)
+# Honor X-Forwarded-Proto/Host when running behind a reverse proxy (nginx/Caddy).
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+except Exception:
+    pass
+
 
 def load_users():
     if os.path.exists(USERS_PATH):
@@ -537,6 +553,7 @@ def login():
             error = "This account has been disabled. Contact an administrator."
         else:
             session.clear()
+            session.permanent = True
             session['username'] = user['username']
             nxt = request.args.get('next') or url_for('index')
             # Only allow internal redirects
@@ -2961,20 +2978,49 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == '__main__':
-    # Parse CLI port if passed
+    # ---- Host/port resolution ----
+    # Port:  CLI arg 1  ->  env HERO_PORT  ->  5000
+    # Host:  env HERO_HOST  ->  127.0.0.1 (local only)
+    #        Set HERO_HOST=0.0.0.0 to accept connections from other machines
+    #        (central-server mode). Do that ONLY behind HTTPS + a firewall.
     port = 5000
     if len(sys.argv) > 1:
         try:
             port = int(sys.argv[1])
         except ValueError:
             pass
-            
-    print(f"==================================================")
-    print(f" Hero SMS Web UI Server running at:")
-    print(f" http://127.0.0.1:{port}")
-    print(f"==================================================")
-    
-    app.run(host='127.0.0.1', port=port, debug=False)
+    else:
+        try:
+            port = int(os.environ.get("HERO_PORT", "5000"))
+        except ValueError:
+            port = 5000
+
+    host = os.environ.get("HERO_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    exposed = host not in ("127.0.0.1", "localhost")
+
+    print("==================================================")
+    print(" Hero SMS Web UI Server")
+    print(f" Binding: {host}:{port}")
+    if exposed:
+        print(f" Reachable on your network at: http://<this-server-ip>:{port}")
+        if os.environ.get("HERO_HTTPS", "").lower() not in ("1", "true", "yes"):
+            print(" [!] WARNING: exposed without HTTPS. Logins are sent in the clear.")
+            print("     Put this behind an HTTPS reverse proxy (Caddy/nginx) and")
+            print("     set HERO_HTTPS=1, or restrict access with a firewall/VPN.")
+    else:
+        print(f" Local only: http://127.0.0.1:{port}")
+    print(" Default login: admin / admin  (change it after first sign-in)")
+    print("==================================================")
+
+    # Prefer a production WSGI server (waitress) so it can handle multiple
+    # simultaneous users. Fall back to Flask's dev server if not installed.
+    try:
+        from waitress import serve
+        serve(app, host=host, port=port, threads=8)
+    except ImportError:
+        print(" [i] 'waitress' not installed - using Flask's built-in dev server.")
+        print("     For a shared server run: pip install waitress")
+        app.run(host=host, port=port, debug=False, threaded=True)
 
 
 ==================================================
@@ -7203,6 +7249,7 @@ FILE: requirements.txt
 flask
 playwright
 pyperclip
+waitress
 
 
 ==================================================
