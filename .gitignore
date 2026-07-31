@@ -34,3 +34,8 @@ service.json
 # Isolated per-person instances (created at runtime by new_instance)
 instances.json
 instances/
+
+# Client edition: collector data + keys + generated client packages
+client_keys.json
+Client_Recoveries/
+client_builds/

