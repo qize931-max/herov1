@@ -2566,9 +2566,13 @@ HTML_TEMPLATE = """
                 </div>
                 <div id="clients_msg" class="modal-msg"></div>
                 <div id="clients_key_box" style="display:none;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.35);border-radius:8px;padding:0.7rem 0.9rem;margin-bottom:0.9rem;font-size:0.82rem;">
-                    <div style="color:#6ee7b7;font-weight:600;margin-bottom:0.3rem;">Client created — copy this key into make_client:</div>
-                    <div>Name: <code id="ck_name"></code></div>
-                    <div>Key: <code id="ck_key" style="word-break:break-all;"></code></div>
+                    <div style="color:#6ee7b7;font-weight:600;margin-bottom:0.4rem;">Client created — copy this key into make_client:</div>
+                    <div style="margin-bottom:0.3rem;">Name: <code id="ck_name"></code></div>
+                    <div style="display:flex;align-items:center;gap:0.5rem;">
+                        <span>Key:</span>
+                        <code id="ck_key" style="word-break:break-all;flex:1;"></code>
+                        <button class="btn-primary" style="padding:0.3rem 0.7rem;font-size:0.75rem;" onclick="copyText(document.getElementById('ck_key').textContent, this)">Copy</button>
+                    </div>
                 </div>
                 <table class="users-table">
                     <thead><tr><th>Client</th><th>Status</th><th>Last seen</th><th>Recovered</th><th>Actions</th></tr></thead>
@@ -2976,6 +2980,29 @@ HTML_TEMPLATE = """
             if (!confirm('Delete instance "' + name + '"? Its accounts, config and results are permanently removed.')) return;
             fetch('/api/instances/' + encodeURIComponent(name), {method: 'DELETE'})
                 .then(r => r.json()).then(d => { setInstancesMsg(d.message, d.status === 'success'); loadInstances(); });
+        }
+
+        // Copy helper that also works on insecure origins (plain HTTP / IP),
+        // where navigator.clipboard is unavailable.
+        function copyText(text, btn) {
+            const done = () => {
+                if (btn) { const t = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => { btn.textContent = t; }, 1200); }
+            };
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+            } else {
+                fallbackCopy(text, done);
+            }
+        }
+        function fallbackCopy(text, done) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.top = '-1000px';
+            document.body.appendChild(ta);
+            ta.focus(); ta.select();
+            try { document.execCommand('copy'); if (done) done(); } catch (e) {}
+            document.body.removeChild(ta);
         }
 
         // ===== Owner: clients running on their own PC =====
