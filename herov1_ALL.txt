@@ -8590,9 +8590,25 @@ $startBat = @"
 title Hero SMS - $name
 cd /d "%~dp0"
 echo Setting up (first run installs Python packages)...
-python --version >nul 2>&1 || (echo Please install Python 3.10+ from python.org, then re-run. & pause & exit /b)
-python -m pip install -r requirements.txt
-python -m playwright install chromium
+
+REM Pick a STABLE Python. Playwright's greenlet has no working build on 3.13/3.14,
+REM so prefer 3.12 then 3.11 via the py launcher, and avoid a too-new default python.
+set "PYEXE="
+py -3.12 --version >nul 2>&1 && set "PYEXE=py -3.12"
+if not defined PYEXE ( py -3.11 --version >nul 2>&1 && set "PYEXE=py -3.11" )
+if not defined PYEXE ( py -3.10 --version >nul 2>&1 && set "PYEXE=py -3.10" )
+if not defined PYEXE ( python --version >nul 2>&1 && set "PYEXE=python" )
+if not defined PYEXE (
+  echo.
+  echo Python 3.12 is required. Install it from:
+  echo   https://www.python.org/downloads/release/python-3129/
+  echo Tick "Add Python to PATH" during install, then run START.bat again.
+  pause
+  exit /b
+)
+echo Using: %PYEXE%
+%PYEXE% -m pip install -r requirements.txt
+%PYEXE% -m playwright install chromium
 set HERO_CLIENT_ID=$name
 set HERO_CLIENT_KEY=$key
 set HERO_COLLECTOR_URL=$collector
@@ -8601,7 +8617,7 @@ set HERO_CLIENT_LOGIN_PASS=$loginPass
 set HERO_HOST=127.0.0.1
 echo Opening dashboard at http://127.0.0.1:5000  (login: $loginUser / $loginPass)
 start "" http://127.0.0.1:5000
-python app.py 5000
+%PYEXE% app.py 5000
 pause
 "@
 Set-Content -Path (Join-Path $dest 'START.bat') -Value $startBat -Encoding ASCII
