@@ -2556,10 +2556,20 @@ HTML_TEMPLATE = """
             <div class="modal-body">
                 <p style="font-size:0.82rem;color:var(--text-muted);margin-bottom:0.9rem;">
                     These clients run the app on their own computer (their Chrome, their IP). Their recovered
-                    accounts auto-upload to your <b>Client_Recoveries</b> folder. To add a new one, run
-                    <b>make_client.bat</b> on this PC, then send them the built package.
+                    accounts auto-upload to your <b>Client_Recoveries</b> folder.
+                    <b>1)</b> Create the client here to get its key.
+                    <b>2)</b> Run <b>make_client.bat</b> with that key to build the package you send them.
                 </p>
+                <div class="user-create-row" style="grid-template-columns: 1fr auto;">
+                    <input type="text" id="nc_name" placeholder="New client name (e.g. RAIHAN)">
+                    <button onclick="createClient()" class="btn-primary">Create &amp; get key</button>
+                </div>
                 <div id="clients_msg" class="modal-msg"></div>
+                <div id="clients_key_box" style="display:none;background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.35);border-radius:8px;padding:0.7rem 0.9rem;margin-bottom:0.9rem;font-size:0.82rem;">
+                    <div style="color:#6ee7b7;font-weight:600;margin-bottom:0.3rem;">Client created — copy this key into make_client:</div>
+                    <div>Name: <code id="ck_name"></code></div>
+                    <div>Key: <code id="ck_key" style="word-break:break-all;"></code></div>
+                </div>
                 <table class="users-table">
                     <thead><tr><th>Client</th><th>Status</th><th>Last seen</th><th>Recovered</th><th>Actions</th></tr></thead>
                     <tbody id="clients_tbody"></tbody>
@@ -3014,6 +3024,24 @@ HTML_TEMPLATE = """
                     tb.appendChild(tr);
                 });
             }).catch(() => setClientsMsg('Failed to load clients.', false));
+        }
+        function createClient() {
+            const name = document.getElementById('nc_name').value.trim();
+            if (!name) { setClientsMsg('Enter a client name.', false); return; }
+            fetch('/api/clients', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({client_id: name})
+            }).then(r => r.json()).then(d => {
+                if (d.status === 'success') {
+                    setClientsMsg('', true);
+                    document.getElementById('nc_name').value = '';
+                    document.getElementById('ck_name').textContent = d.client_id;
+                    document.getElementById('ck_key').textContent = d.key;
+                    document.getElementById('clients_key_box').style.display = 'block';
+                    loadClients();
+                } else { setClientsMsg(d.message, false); }
+            });
         }
         function toggleClient(id) {
             fetch('/api/clients/' + encodeURIComponent(id) + '/toggle', {method: 'POST'})
