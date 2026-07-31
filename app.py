@@ -72,10 +72,18 @@ def save_config_data(data):
 # ==========================================================================
 USERS_PATH = os.path.join(BASE_DIR, "users.json")
 SECRET_PATH = os.path.join(BASE_DIR, "secret.key")
+SERVICE_PATH = os.path.join(BASE_DIR, "service.json")
 
-# Default admin account created on first run. Change the password after logging in.
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD = "admin"
+# The default OWNER account, created on first run. This is YOU — the account
+# nobody else can disable, delete, or lock out. Change its password immediately.
+DEFAULT_OWNER_USERNAME = "admin"
+DEFAULT_OWNER_PASSWORD = "admin"
+
+# Role hierarchy: owner > admin > user
+#   owner : you. Untouchable. Only role that controls the global kill switch.
+#   admin : can manage (create/disable/delete) users and admins, but never the owner.
+#   user  : can operate the dashboard only.
+DEFAULT_SERVICE_MESSAGE = "This service is temporarily suspended by the administrator."
 
 
 def _load_or_create_secret():
@@ -144,17 +152,64 @@ def find_user(username):
     return None
 
 
-def ensure_default_admin():
-    """Seed a default admin account if no users exist yet."""
+def is_owner(user):
+    return bool(user) and user.get("role") == "owner"
+
+
+def is_admin(user):
+    # Owner has all admin powers too
+    return bool(user) and user.get("role") in ("owner", "admin")
+
+
+def user_active(user):
+    """A user may sign in / act only while their account is enabled."""
+    return bool(user) and user.get("enabled", True)
+
+
+# ---- Global service kill switch ----
+def load_service():
+    state = {"locked": False, "message": DEFAULT_SERVICE_MESSAGE, "updated_at": 0}
+    if os.path.exists(SERVICE_PATH):
+        try:
+            with open(SERVICE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                state.update({k: data[k] for k in ("locked", "message", "updated_at") if k in data})
+        except Exception:
+            pass
+    return state
+
+
+def save_service(state):
+    try:
+        with open(SERVICE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=4)
+        return True
+    except Exception:
+        return False
+
+
+def service_locked():
+    return bool(load_service().get("locked", False))
+
+
+def ensure_default_owner():
+    """Seed the owner account on first run, and make sure an owner always exists."""
     users = load_users()
     if not users:
         users.append({
-            "username": DEFAULT_ADMIN_USERNAME,
-            "password_hash": generate_password_hash(DEFAULT_ADMIN_PASSWORD),
-            "role": "admin",
+            "username": DEFAULT_OWNER_USERNAME,
+            "password_hash": generate_password_hash(DEFAULT_OWNER_PASSWORD),
+            "role": "owner",
             "enabled": True,
             "created_at": int(time.time()),
         })
+        save_users(users)
+        return
+    # Safety net: if somehow no owner exists, promote the first account to owner
+    if not any(u.get("role") == "owner" for u in users):
+        users[0]["role"] = "owner"
+        users[0]["enabled"] = True
         save_users(users)
 
 
@@ -171,11 +226,18 @@ def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
     user = current_user()
-    if not user or not user.get("enabled", True):
+    # Not logged in, disabled, or expired -> out
+    if not user_active(user):
         session.clear()
         if request.path.startswith("/api/") or request.path == "/stream":
             return jsonify({"status": "error", "message": "Authentication required."}), 401
         return redirect(url_for("login", next=request.path))
+    # Global kill switch: everyone except the owner is locked out while suspended
+    if service_locked() and not is_owner(user):
+        session.clear()
+        if request.path.startswith("/api/") or request.path == "/stream":
+            return jsonify({"status": "error", "message": "Service suspended."}), 503
+        return redirect(url_for("login", suspended=1))
     return None
 
 
@@ -183,17 +245,30 @@ def admin_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         user = current_user()
-        if not user or not user.get("enabled", True):
+        if not user_active(user):
             session.clear()
             return jsonify({"status": "error", "message": "Authentication required."}), 401
-        if user.get("role") != "admin":
+        if not is_admin(user):
             return jsonify({"status": "error", "message": "Admin privileges required."}), 403
         return f(*args, **kwargs)
     return wrapper
 
 
-# Create the default admin on startup
-ensure_default_admin()
+def owner_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user_active(user):
+            session.clear()
+            return jsonify({"status": "error", "message": "Authentication required."}), 401
+        if not is_owner(user):
+            return jsonify({"status": "error", "message": "Owner privileges required."}), 403
+        return f(*args, **kwargs)
+    return wrapper
+
+
+# Create the default owner on startup
+ensure_default_owner()
 
 def parse_recovered_accounts():
     accounts = []
@@ -426,8 +501,11 @@ def run_automation_process():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    ensure_default_admin()
+    ensure_default_owner()
+    svc = load_service()
     error = None
+    # Banner shown when a suspended non-owner is bounced back here
+    notice = svc.get("message") if (svc.get("locked") and request.args.get("suspended")) else None
     if request.method == 'POST':
         username = (request.form.get('username') or '').strip()
         password = request.form.get('password') or ''
@@ -436,6 +514,9 @@ def login():
             error = "Invalid username or password."
         elif not user.get('enabled', True):
             error = "This account has been disabled. Contact an administrator."
+        elif svc.get("locked") and not is_owner(user):
+            # Service suspended: only the owner may sign in
+            notice = svc.get("message") or DEFAULT_SERVICE_MESSAGE
         else:
             session.clear()
             session.permanent = True
@@ -445,7 +526,7 @@ def login():
             if not nxt.startswith('/'):
                 nxt = url_for('index')
             return redirect(nxt)
-    return render_template_string(LOGIN_TEMPLATE, error=error)
+    return render_template_string(LOGIN_TEMPLATE, error=error, notice=notice)
 
 
 @app.route('/logout')
@@ -457,11 +538,41 @@ def logout():
 @app.route('/api/me', methods=['GET'])
 def api_me():
     user = current_user()
+    svc = load_service()
     return jsonify({
         "username": user["username"],
         "role": user.get("role", "user"),
-        "is_admin": user.get("role") == "admin",
+        "is_admin": is_admin(user),
+        "is_owner": is_owner(user),
+        "service_locked": bool(svc.get("locked")),
+        "service_message": svc.get("message", DEFAULT_SERVICE_MESSAGE),
     })
+
+
+@app.route('/api/service', methods=['GET'])
+def api_service_status():
+    svc = load_service()
+    return jsonify({
+        "locked": bool(svc.get("locked")),
+        "message": svc.get("message", DEFAULT_SERVICE_MESSAGE),
+        "updated_at": svc.get("updated_at", 0),
+    })
+
+
+@app.route('/api/service', methods=['POST'])
+@owner_required
+def api_service_set():
+    """Owner-only global kill switch. Body: {"locked": bool, "message": str?}"""
+    data = request.json or {}
+    svc = load_service()
+    if "locked" in data:
+        svc["locked"] = bool(data["locked"])
+    if data.get("message"):
+        svc["message"] = str(data["message"])[:300]
+    svc["updated_at"] = int(time.time())
+    save_service(svc)
+    state = "suspended" if svc["locked"] else "active"
+    return jsonify({"status": "success", "message": f"Service is now {state}.", "locked": svc["locked"]})
 
 
 @app.route('/api/change_password', methods=['POST'])
@@ -540,11 +651,9 @@ def api_users_toggle(username):
             break
     if not target:
         return jsonify({"status": "error", "message": "User not found."}), 404
-    # Prevent disabling the last enabled admin
-    if target.get('role') == 'admin' and target.get('enabled', True):
-        enabled_admins = [u for u in users if u.get('role') == 'admin' and u.get('enabled', True)]
-        if len(enabled_admins) <= 1:
-            return jsonify({"status": "error", "message": "Cannot disable the last active admin."}), 400
+    # The owner account is untouchable
+    if target.get('role') == 'owner':
+        return jsonify({"status": "error", "message": "The owner account cannot be disabled."}), 400
     target['enabled'] = not target.get('enabled', True)
     save_users(users)
     state = "enabled" if target['enabled'] else "disabled"
@@ -561,10 +670,9 @@ def api_users_delete(username):
     target = next((u for u in users if u['username'].lower() == username.lower()), None)
     if not target:
         return jsonify({"status": "error", "message": "User not found."}), 404
-    if target.get('role') == 'admin':
-        enabled_admins = [u for u in users if u.get('role') == 'admin' and u.get('enabled', True)]
-        if target.get('enabled', True) and len(enabled_admins) <= 1:
-            return jsonify({"status": "error", "message": "Cannot delete the last active admin."}), 400
+    # The owner account is untouchable
+    if target.get('role') == 'owner':
+        return jsonify({"status": "error", "message": "The owner account cannot be deleted."}), 400
     users = [u for u in users if u['username'].lower() != username.lower()]
     save_users(users)
     return jsonify({"status": "success", "message": f"User '{username}' deleted."})
@@ -578,7 +686,8 @@ def index():
     return render_template_string(
         HTML_TEMPLATE,
         current_username=user["username"],
-        is_admin=(user.get("role") == "admin"),
+        is_admin=is_admin(user),
+        is_owner=is_owner(user),
     )
 
 
@@ -1028,6 +1137,16 @@ LOGIN_TEMPLATE = """
             margin-bottom: 1.2rem;
             text-align: center;
         }
+        .notice {
+            background: rgba(245,158,11,0.12);
+            border: 1px solid rgba(245,158,11,0.4);
+            color: #fcd34d;
+            padding: 0.7rem 0.9rem;
+            border-radius: 10px;
+            font-size: 0.85rem;
+            margin-bottom: 1.2rem;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -1037,6 +1156,7 @@ LOGIN_TEMPLATE = """
             <span>Hero SMS Automation</span>
         </div>
         <div class="login-sub">Sign in to continue</div>
+        {% if notice %}<div class="notice">{{ notice }}</div>{% endif %}
         {% if error %}<div class="error">{{ error }}</div>{% endif %}
         <form method="POST">
             <label for="username">Username</label>
@@ -1670,6 +1790,12 @@ HTML_TEMPLATE = """
             transition: background .15s, border-color .15s;
         }
         .header-btn:hover { background: rgba(99,102,241,0.18); border-color: var(--primary-glow); }
+        /* Kill-switch button: green when service is live, red when suspended */
+        #serviceBtn.svc-active { border-color: rgba(16,185,129,0.5); color: #6ee7b7; }
+        #serviceBtn.svc-active:hover { background: rgba(16,185,129,0.15); }
+        #serviceBtn.svc-locked { border-color: rgba(239,68,68,0.6); color: #fca5a5; background: rgba(239,68,68,0.12); }
+        #serviceBtn.svc-locked:hover { background: rgba(239,68,68,0.2); }
+        .badge-owner { background: rgba(245,158,11,0.18); color: #fcd34d; }
         .modal-overlay {
             display: none;
             position: fixed; inset: 0;
@@ -1745,6 +1871,11 @@ HTML_TEMPLATE = """
                 <div class="status-dot" id="status-dot"></div>
                 <span id="status-text">Idle</span>
             </div>
+            {% if is_owner %}
+            <button id="serviceBtn" onclick="toggleService()" class="header-btn" title="Suspend or resume the whole service">
+                <span id="serviceBtnLabel">Service</span>
+            </button>
+            {% endif %}
             {% if is_admin %}
             <button onclick="openUsersModal()" class="header-btn" title="Manage users">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-1.13a4 4 0 10-4-4 4 4 0 004 4zm6 0a3 3 0 10-3-3"/></svg>
@@ -2049,6 +2180,41 @@ HTML_TEMPLATE = """
     <script>
         let eventSource = null;
 
+        // ===== Auth: global service kill switch (owner only) =====
+        let serviceLocked = false;
+        function refreshServiceButton() {
+            const btn = document.getElementById('serviceBtn');
+            if (!btn) return; // not the owner
+            fetch('/api/service').then(r => r.json()).then(s => {
+                serviceLocked = !!s.locked;
+                const label = document.getElementById('serviceBtnLabel');
+                if (serviceLocked) {
+                    btn.className = 'header-btn svc-locked';
+                    label.textContent = 'Service: SUSPENDED';
+                    btn.title = 'Service is suspended for everyone but you. Click to resume.';
+                } else {
+                    btn.className = 'header-btn svc-active';
+                    label.textContent = 'Service: Active';
+                    btn.title = 'Service is live. Click to suspend all other users instantly.';
+                }
+            });
+        }
+        function toggleService() {
+            const willLock = !serviceLocked;
+            const msg = willLock
+                ? 'Suspend the ENTIRE service now? Every other user is logged out immediately and cannot sign back in until you resume. You keep full access.'
+                : 'Resume the service so users can log in again?';
+            if (!confirm(msg)) return;
+            fetch('/api/service', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({locked: willLock})
+            }).then(r => r.json()).then(d => {
+                refreshServiceButton();
+                if (typeof showToast === 'function') showToast(d.message, d.status === 'success' ? 'success' : 'error');
+            });
+        }
+
         // ===== Auth: user management + password modals =====
         function openUsersModal() {
             document.getElementById('usersModal').classList.add('open');
@@ -2068,21 +2234,24 @@ HTML_TEMPLATE = """
                 tb.innerHTML = '';
                 users.forEach(u => {
                     const tr = document.createElement('tr');
-                    const roleBadge = u.role === 'admin'
-                        ? '<span class="badge badge-admin">Admin</span>'
-                        : '<span class="badge badge-user">User</span>';
+                    let roleBadge;
+                    if (u.role === 'owner') roleBadge = '<span class="badge badge-owner">Owner</span>';
+                    else if (u.role === 'admin') roleBadge = '<span class="badge badge-admin">Admin</span>';
+                    else roleBadge = '<span class="badge badge-user">User</span>';
                     const statusBadge = u.enabled
                         ? '<span class="badge badge-on">Active</span>'
                         : '<span class="badge badge-off">Disabled</span>';
                     const toggleLabel = u.enabled ? 'Disable' : 'Enable';
+                    // The owner row is protected - no disable/delete buttons
+                    const actions = (u.role === 'owner')
+                        ? '<span style="color:var(--text-muted);font-size:0.78rem;">Protected</span>'
+                        : '<button class="row-action" onclick="toggleUser(\\'' + u.username + '\\')">' + toggleLabel + '</button>' +
+                          '<button class="row-action danger" onclick="deleteUser(\\'' + u.username + '\\')">Delete</button>';
                     tr.innerHTML =
                         '<td>' + u.username + '</td>' +
                         '<td>' + roleBadge + '</td>' +
                         '<td>' + statusBadge + '</td>' +
-                        '<td>' +
-                            '<button class="row-action" onclick="toggleUser(\\'' + u.username + '\\')">' + toggleLabel + '</button>' +
-                            '<button class="row-action danger" onclick="deleteUser(\\'' + u.username + '\\')">Delete</button>' +
-                        '</td>';
+                        '<td>' + actions + '</td>';
                     tb.appendChild(tr);
                 });
             }).catch(() => setUsersMsg('Failed to load users.', false));
@@ -2151,6 +2320,7 @@ HTML_TEMPLATE = """
             loadAccounts();
             loadStats();
             checkStatus();
+            refreshServiceButton();
             // Polling status
             setInterval(checkStatus, 3000);
         });

@@ -29,3 +29,4 @@ recovered_stats.json
 # Auth: login accounts (hashed) + Flask session secret — never commit
 users.json
 secret.key
+service.json
