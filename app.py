@@ -33,7 +33,7 @@ ACCOUNTS_PATH = os.path.join(BASE_DIR, "recovered_accounts.txt")
 DEFAULT_CONFIG = {
     "chrome_debug_url": "http://127.0.0.1:9222",
     "chrome_profile_name": "Profile 1",
-    "multiple_accounts": False,
+    "multiple_accounts": True,
     "service_text": "Facebook",
     "country_text": "Brazil",
     "buy_text": "Buy for $0.099",
@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
     "max_price": 0.15,
     "target_url": "https://www.facebook.com/login/identify/?ci=AdDhNqxj3bubeKaJl2BAeZF5R84lr1pqkL5Cf2GECCYUaKqqwnbEqH8-EmPr5ktGAoEAQ36l_A8pTW5y1b-Bnht-2xbUC9edHV1cW7O-udVnmbHAM1ZPy-PZmgDLgOHviiToDLhpwlAxn0WywiZA6Y8Wyn-_n9oildrH-L31Wc8bBkOgGVO7udBoB-1zGQIygpu91hfBLtBXTilJ4JnkELUeSBYYFPVtNmnr6RLDvSZ2acPoDdiDrnAOgQOAsKE15PE6ztB0mkwvJZO-LZYfUJXpRt1u",
     "new_password": "HeroSmsRecover123!",
-    "confirm_before_buy": True,
+    "confirm_before_buy": False,
     "auto_login": False,
     "hero_username": "",
     "hero_password": "",
@@ -1379,6 +1379,18 @@ LOGIN_TEMPLATE = """
             transition: background .15s;
         }
         button:hover { background: var(--primary-glow-hover); }
+        .pw-wrap { position: relative; }
+        .pw-wrap > input { padding-right: 4rem; }
+        .pw-toggle {
+            position: absolute; right: 8px; top: 9px;
+            width: auto; margin: 0; padding: 0.3rem 0.55rem;
+            background: rgba(255,255,255,0.06);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.72rem; font-weight: 500; line-height: 1;
+            border-radius: 6px; cursor: pointer;
+        }
+        .pw-toggle:hover { background: rgba(255,255,255,0.12); color: var(--text-main); }
         .error {
             background: rgba(239,68,68,0.12);
             border: 1px solid rgba(239,68,68,0.4);
@@ -1414,10 +1426,21 @@ LOGIN_TEMPLATE = """
             <label for="username">Username</label>
             <input type="text" id="username" name="username" autocomplete="username" autofocus required>
             <label for="password">Password</label>
-            <input type="password" id="password" name="password" autocomplete="current-password" required>
+            <div class="pw-wrap">
+                <input type="password" id="password" name="password" autocomplete="current-password" required>
+                <button type="button" class="pw-toggle" onclick="togglePw('password', this)" aria-label="Show or hide password">Show</button>
+            </div>
             <button type="submit">Sign In</button>
         </form>
     </div>
+    <script>
+        function togglePw(id, btn) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (el.type === 'password') { el.type = 'text'; btn.textContent = 'Hide'; }
+            else { el.type = 'password'; btn.textContent = 'Show'; }
+        }
+    </script>
 </body>
 </html>
 """
@@ -2167,7 +2190,10 @@ HTML_TEMPLATE = """
             <div class="modal-body">
                 <div class="user-create-row">
                     <input type="text" id="nu_username" placeholder="Username">
-                    <input type="password" id="nu_password" placeholder="Password">
+                    <div class="pw-wrap">
+                        <input type="password" id="nu_password" placeholder="Password">
+                        <button type="button" class="pw-toggle" onclick="togglePw('nu_password', this)" aria-label="Show or hide password">Show</button>
+                    </div>
                     <select id="nu_role">
                         <option value="user">User</option>
                         <option value="admin">Admin</option>
