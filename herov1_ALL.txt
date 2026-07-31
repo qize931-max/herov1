@@ -1456,25 +1456,26 @@ def api_launch_chrome():
 
 @app.route('/api/kill_chrome', methods=['POST'])
 def api_kill_chrome():
-    """Kill only the Chrome processes THIS instance launched, so isolated
-    instances on the same machine don't terminate each other's browser."""
+    """Close ONLY the Chrome tied to this instance's debug port (plus any Chrome
+    this instance launched). Other Chrome windows on the PC are left running."""
     try:
-        import subprocess
         global launched_chrome_pids
-        killed = 0
-        for pid in list(launched_chrome_pids):
-            try:
-                if sys.platform == 'win32':
-                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
-                else:
-                    subprocess.run(["kill", "-9", str(pid)], capture_output=True)
-                killed += 1
-            except Exception:
-                pass
+        targets = set(launched_chrome_pids)
+        # Also target whatever is listening on the configured remote-debugging port
+        try:
+            dbg = load_config_data().get("chrome_debug_url", "") or ""
+            m = re.search(r":(\d+)", dbg)
+            if m:
+                pid = _pid_on_port(int(m.group(1)))
+                if pid:
+                    targets.add(pid)
+        except Exception:
+            pass
+        killed = sum(1 for pid in targets if _kill_pid(pid))
         launched_chrome_pids = []
         if killed:
-            return jsonify({"status": "success", "message": f"Closed {killed} Chrome window(s) launched by this instance."})
-        return jsonify({"status": "success", "message": "No Chrome launched by this instance was running."})
+            return jsonify({"status": "success", "message": f"Closed this instance's Chrome ({killed} process). Other Chrome windows are untouched."})
+        return jsonify({"status": "success", "message": "No Chrome for this instance's debug port was running."})
     except Exception as e:
         return jsonify({"status": "error", "message": f"Failed to terminate Chrome: {e}"}), 500
 
@@ -3090,7 +3091,7 @@ HTML_TEMPLATE = """
 
 
         function killChrome() {
-            if (confirm("This will close ALL running Chrome windows and background processes on your PC. Proceed?")) {
+            if (confirm("This will close only the Chrome window used by this instance (its debug port). Other Chrome windows stay open. Proceed?")) {
                 const killBtn = document.getElementById('kill-chrome-btn');
                 killBtn.disabled = true;
                 killBtn.textContent = 'Killing...';
