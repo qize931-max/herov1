@@ -340,10 +340,29 @@ def launch_and_connect_chrome(p, port: int, profile_name: str, user_data_subdir:
         creation_flags = subprocess.CREATE_NEW_CONSOLE
         
     print(f"Launching Chrome on port {port}...")
-    subprocess.Popen(cmd, creationflags=creation_flags)
-    time.sleep(3)
-    
-    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+    try:
+        subprocess.Popen(cmd, creationflags=creation_flags)
+    except FileNotFoundError:
+        print("❌ Google Chrome is not installed on this PC.")
+        print("   Install Chrome from https://www.google.com/chrome/ , then click Start again.")
+        raise RuntimeError("Google Chrome not found")
+
+    # Wait for Chrome's remote-debugging port to come up. Slower machines / the
+    # first launch need more than a fixed 3s, so retry for up to ~30 seconds.
+    browser = None
+    last_err = None
+    for _ in range(60):
+        try:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    if browser is None:
+        print("❌ Chrome started but its debug port never opened.")
+        print("   Close ALL Chrome windows completely, then click Start again.")
+        print("   (If it keeps failing, make sure Google Chrome is installed.)")
+        raise last_err
     context = browser.contexts[0] if browser.contexts else browser.new_context()
     
     try:
