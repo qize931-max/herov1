@@ -1193,6 +1193,36 @@ def api_clients_log(cid):
     return jsonify({"client_id": cid, "lines": lines})
 
 
+@app.route('/api/activity', methods=['GET'])
+@owner_required
+@manager_required
+def api_activity():
+    """Combined activity feed across ALL clients, plus summary totals."""
+    keys = load_client_keys()
+    summary = {
+        "clients": len(keys),
+        "active": sum(1 for c in keys if c.get("enabled", True)),
+        "total_recovered": sum(int(c.get("last_count", 0)) for c in keys),
+    }
+    events = []
+    if os.path.isdir(COLLECTOR_DIR):
+        for name in os.listdir(COLLECTOR_DIR):
+            logpath = os.path.join(COLLECTOR_DIR, name, "activity.log")
+            if not os.path.exists(logpath):
+                continue
+            try:
+                with open(logpath, "r", encoding="utf-8") as f:
+                    for line in f.read().splitlines():
+                        m = re.match(r'^\[([^\]]+)\]\s*(.*)$', line)
+                        if m:
+                            events.append({"time": m.group(1), "client": name, "message": m.group(2)})
+            except Exception:
+                pass
+    # Newest first (YYYY-MM-DD HH:MM:SS sorts correctly as a string)
+    events.sort(key=lambda e: e["time"], reverse=True)
+    return jsonify({"summary": summary, "events": events[:500]})
+
+
 def _client_stop_bot():
     try:
         if is_running:
@@ -2535,6 +2565,10 @@ HTML_TEMPLATE = """
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 15a4 4 0 004 4h9a5 5 0 001-9.9A5 5 0 007 8a4 4 0 00-4 4 3 3 0 000 3z"/></svg>
                 Clients
             </button>
+            <button onclick="openActivityModal()" class="header-btn" title="Activity log across all clients">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-6h13M9 5h13M5 5h.01M5 12h.01M5 19h.01"/></svg>
+                Activity
+            </button>
             {% endif %}
             {% if is_admin %}
             <button onclick="openUsersModal()" class="header-btn" title="Manage users">
@@ -2635,6 +2669,37 @@ HTML_TEMPLATE = """
                 <table class="users-table">
                     <thead><tr><th>Client</th><th>Status</th><th>Last seen</th><th>Recovered</th><th>Actions</th></tr></thead>
                     <tbody id="clients_tbody"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== Global activity dashboard modal (owner) ===== -->
+    <div id="activityModal" class="modal-overlay" onclick="if(event.target===this)closeActivityModal()">
+        <div class="modal-box" style="max-width:720px;">
+            <div class="modal-header">
+                <h2>Activity — all clients</h2>
+                <button class="modal-close" onclick="closeActivityModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;">
+                    <div style="flex:1;min-width:120px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:10px;padding:0.7rem 0.9rem;">
+                        <div style="font-size:1.4rem;font-weight:700;" id="act_clients">0</div>
+                        <div style="font-size:0.72rem;color:var(--text-muted);">CLIENTS</div>
+                    </div>
+                    <div style="flex:1;min-width:120px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.25);border-radius:10px;padding:0.7rem 0.9rem;">
+                        <div style="font-size:1.4rem;font-weight:700;color:#6ee7b7;" id="act_active">0</div>
+                        <div style="font-size:0.72rem;color:var(--text-muted);">ACTIVE</div>
+                    </div>
+                    <div style="flex:1;min-width:120px;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);border-radius:10px;padding:0.7rem 0.9rem;">
+                        <div style="font-size:1.4rem;font-weight:700;color:#a5b4fc;" id="act_recovered">0</div>
+                        <div style="font-size:0.72rem;color:var(--text-muted);">TOTAL RECOVERED</div>
+                    </div>
+                </div>
+                <div id="activity_msg" class="modal-msg"></div>
+                <table class="users-table">
+                    <thead><tr><th style="width:150px;">Time</th><th style="width:120px;">Client</th><th>Event</th></tr></thead>
+                    <tbody id="activity_tbody"></tbody>
                 </table>
             </div>
         </div>
@@ -3155,6 +3220,37 @@ HTML_TEMPLATE = """
             const a = document.createElement('a');
             a.href = '/api/clients/' + encodeURIComponent(id) + '/download';
             document.body.appendChild(a); a.click(); a.remove();
+        }
+        function openActivityModal() {
+            document.getElementById('activityModal').classList.add('open');
+            loadActivity();
+        }
+        function closeActivityModal() {
+            document.getElementById('activityModal').classList.remove('open');
+        }
+        function loadActivity() {
+            fetch('/api/activity').then(r => r.json()).then(d => {
+                document.getElementById('act_clients').textContent = d.summary.clients;
+                document.getElementById('act_active').textContent = d.summary.active;
+                document.getElementById('act_recovered').textContent = d.summary.total_recovered;
+                const tb = document.getElementById('activity_tbody');
+                tb.innerHTML = '';
+                if (!d.events || !d.events.length) {
+                    tb.innerHTML = '<tr><td colspan="3" style="color:var(--text-muted);">No activity yet.</td></tr>';
+                    return;
+                }
+                d.events.forEach(e => {
+                    const isDisable = /disabled/i.test(e.message);
+                    const isRecover = /recovered/i.test(e.message);
+                    const color = isDisable ? '#fca5a5' : (isRecover ? '#6ee7b7' : 'var(--text-main)');
+                    const tr = document.createElement('tr');
+                    tr.innerHTML =
+                        '<td style="color:var(--text-muted);font-size:0.8rem;">' + e.time + '</td>' +
+                        '<td><span class="badge badge-user">' + e.client + '</span></td>' +
+                        '<td style="color:' + color + ';">' + e.message + '</td>';
+                    tb.appendChild(tr);
+                });
+            }).catch(() => { document.getElementById('activity_msg').textContent = 'Failed to load activity.'; });
         }
         function viewClientLog(id) {
             document.getElementById('client_log_title').textContent = 'Activity — ' + id;
