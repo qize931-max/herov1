@@ -43,15 +43,40 @@ foreach ($f in @('app.py','hero_sms_automation.py','clean_unused_profiles.py','a
     if (Test-Path $src) { Copy-Item $src -Destination $dest -Force }
 }
 
+# If a bundled Python runtime exists, include it so the client needs NO Python.
+$runtimeSrc = Join-Path $root "runtime"
+$bundled = Test-Path (Join-Path $runtimeSrc "python.exe")
+if ($bundled) {
+    Write-Host "Bundling embedded Python (client will need nothing installed)..."
+    Copy-Item $runtimeSrc -Destination (Join-Path $dest "runtime") -Recurse -Force
+}
+
 # Client launcher (installs deps, sets client env, runs locally, opens browser)
-$startBat = @"
+if ($bundled) {
+    # Self-contained: uses the bundled Python, no install of anything.
+    $startBat = @"
+@echo off
+title Hero SMS - $name
+cd /d "%~dp0"
+set HERO_CLIENT_ID=$name
+set HERO_CLIENT_KEY=$key
+set HERO_COLLECTOR_URL=$collector
+set HERO_CLIENT_LOGIN_USER=$loginUser
+set HERO_CLIENT_LOGIN_PASS=$loginPass
+set HERO_HOST=127.0.0.1
+echo Starting... a browser window will open at http://127.0.0.1:5000
+echo Login: $loginUser / $loginPass
+start "" http://127.0.0.1:5000
+"%~dp0runtime\python.exe" app.py 5000
+pause
+"@
+} else {
+    # No bundled runtime: needs a system Python 3.12 (via the py launcher).
+    $startBat = @"
 @echo off
 title Hero SMS - $name
 cd /d "%~dp0"
 echo Setting up (first run installs Python packages)...
-
-REM Pick a STABLE Python. Playwright's greenlet has no working build on 3.13/3.14,
-REM so prefer 3.12 then 3.11 via the py launcher, and avoid a too-new default python.
 set "PYEXE="
 py -3.12 --version >nul 2>&1 && set "PYEXE=py -3.12"
 if not defined PYEXE ( py -3.11 --version >nul 2>&1 && set "PYEXE=py -3.11" )
@@ -79,6 +104,7 @@ start "" http://127.0.0.1:5000
 %PYEXE% app.py 5000
 pause
 "@
+}
 Set-Content -Path (Join-Path $dest 'START.bat') -Value $startBat -Encoding ASCII
 
 Write-Host ""
