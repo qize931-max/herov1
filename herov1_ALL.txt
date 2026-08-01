@@ -8730,6 +8730,40 @@ pause
 }
 Set-Content -Path (Join-Path $dest 'START.bat') -Value $startBat -Encoding ASCII
 
+# Plain-language instructions for the client
+$readme = @"
+HERO SMS - HOW TO USE (read this first)
+=======================================
+
+BEFORE YOU START, you need:
+  * Windows PC
+  * Google Chrome installed  (https://www.google.com/chrome/)
+
+STEP 1 - EXTRACT THIS FOLDER FIRST (important!)
+  Do NOT run from inside the .zip. Right-click the zip -> "Extract All" ->
+  wait for it to finish -> open the extracted folder.
+  You should see START.bat next to a folder called "runtime".
+
+STEP 2 - RUN
+  Double-click START.bat.
+  If Windows shows "Windows protected your PC", click "More info" -> "Run anyway".
+  A browser window opens at http://127.0.0.1:5000
+
+STEP 3 - LOG IN
+  Username: $loginUser
+  Password: $loginPass
+
+STEP 4 - USE IT
+  Click "Launch Chrome" -> log into Facebook + Hero SMS in the Chrome window
+  that opens -> set your options -> click "Start Automation".
+
+TROUBLE?
+  * "greenlet" / DLL error  -> you didn't extract the zip fully. Redo STEP 1.
+  * Chrome / 9222 error      -> install Google Chrome, close all Chrome windows,
+                                then click Start again.
+"@
+Set-Content -Path (Join-Path $dest 'READ ME FIRST.txt') -Value $readme -Encoding ASCII
+
 Write-Host ""
 Write-Host "Done. Client package built:"
 Write-Host "  $dest"
