@@ -45,7 +45,12 @@ DEFAULT_CONFIG = {
     "auto_login": False,
     "hero_username": "",
     "hero_password": "",
-    "vpn_connection_name": ""
+    "vpn_connection_name": "",
+    "use_api": False,
+    "api_base_url": "",
+    "api_key": "",
+    "api_service_code": "",
+    "api_country_code": "0"
 }
 
 def load_config_data():
@@ -2854,6 +2859,41 @@ HTML_TEMPLATE = """
                 <input type="text" id="vpn_connection_name" placeholder="Surfshark">
             </div>
 
+            <!-- ===== API MODE (use a provider's API instead of the website) ===== -->
+            <div style="border: 1px dashed rgba(99,102,241,0.5); padding: 1rem; border-radius: 8px; margin: 0.25rem 0; background: rgba(99,102,241,0.04);">
+                <label class="checkbox-container" style="padding: 0; margin-bottom: 0.5rem;">
+                    <input type="checkbox" id="use_api" onchange="toggleApiFields()">
+                    <span class="custom-checkbox"></span>
+                    Use API mode (buy number + OTP via provider API — no website scraping)
+                </label>
+                <div style="font-size:0.72rem;color:var(--text-muted);margin-bottom:0.6rem;">
+                    Works with sms-activate / sms-man / tiger-sms and other compatible providers (getNumber/getStatus).
+                </div>
+                <div id="api-fields" style="display:none; flex-direction:column; gap:0.75rem;">
+                    <div class="input-group">
+                        <label style="font-size:0.75rem;">API Base URL</label>
+                        <input type="text" id="api_base_url" placeholder="https://api.sms-activate.org/stubs/handler_api.php">
+                    </div>
+                    <div class="input-group">
+                        <label style="font-size:0.75rem;">API Key</label>
+                        <div class="pw-wrap">
+                            <input type="password" id="api_key" placeholder="your API key">
+                            <button type="button" class="pw-toggle" onclick="togglePw('api_key', this)">Show</button>
+                        </div>
+                    </div>
+                    <div style="display:grid; grid-template-columns:1fr 1fr; gap:0.5rem;">
+                        <div class="input-group">
+                            <label style="font-size:0.75rem;">Service code (e.g. fb)</label>
+                            <input type="text" id="api_service_code" placeholder="fb">
+                        </div>
+                        <div class="input-group">
+                            <label style="font-size:0.75rem;">Country code (e.g. 0)</label>
+                            <input type="text" id="api_country_code" placeholder="0">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div style="border: 1px dashed var(--border-color); padding: 1rem; border-radius: 8px; margin: 0.25rem 0; background: rgba(255,255,255,0.01);">
                 <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem;">
                     <label class="checkbox-container" style="padding: 0;">
@@ -3476,8 +3516,19 @@ HTML_TEMPLATE = """
                     document.getElementById('auto_login').checked = !!data.auto_login;
                     document.getElementById('hero_username').value = data.hero_username || '';
                     document.getElementById('hero_password').value = data.hero_password || '';
+                    document.getElementById('use_api').checked = !!data.use_api;
+                    document.getElementById('api_base_url').value = data.api_base_url || '';
+                    document.getElementById('api_key').value = data.api_key || '';
+                    document.getElementById('api_service_code').value = data.api_service_code || '';
+                    document.getElementById('api_country_code').value = data.api_country_code || '0';
                     toggleAutoLoginFields();
+                    toggleApiFields();
                 });
+        }
+
+        function toggleApiFields() {
+            const on = document.getElementById('use_api').checked;
+            document.getElementById('api-fields').style.display = on ? 'flex' : 'none';
         }
 
         function saveConfig(silent = false) {
@@ -3497,7 +3548,12 @@ HTML_TEMPLATE = """
                 
                 auto_login: document.getElementById('auto_login').checked,
                 hero_username: document.getElementById('hero_username').value,
-                hero_password: document.getElementById('hero_password').value
+                hero_password: document.getElementById('hero_password').value,
+                use_api: document.getElementById('use_api').checked,
+                api_base_url: document.getElementById('api_base_url').value,
+                api_key: document.getElementById('api_key').value,
+                api_service_code: document.getElementById('api_service_code').value,
+                api_country_code: document.getElementById('api_country_code').value
             };
 
             return fetch('/api/config', {

@@ -772,6 +772,15 @@ class AutomationConfig:
     min_price: float = 0.01
     max_price: float = 0.15
 
+    # ---- API mode (sms-activate protocol: getNumber / getStatus / setStatus) ----
+    # When use_api is True, the number + OTP come from the provider's API instead
+    # of scraping the website. Works with sms-activate, sms-man, tiger-sms, etc.
+    use_api: bool = False
+    api_base_url: str = ""      # e.g. https://api.sms-activate.org/stubs/handler_api.php
+    api_key: str = ""
+    api_service_code: str = ""  # provider's service code, e.g. "fb" for Facebook
+    api_country_code: str = "0" # provider's country code, e.g. "0"
+
 
 def load_config() -> AutomationConfig:
     import json
@@ -790,7 +799,12 @@ def load_config() -> AutomationConfig:
         "hero_password": "",
         "vpn_connection_name": "",
         "min_price": 0.01,
-        "max_price": 0.15
+        "max_price": 0.15,
+        "use_api": False,
+        "api_base_url": "",
+        "api_key": "",
+        "api_service_code": "",
+        "api_country_code": "0"
     }
     
     if os.path.exists(config_path):
@@ -816,7 +830,12 @@ def load_config() -> AutomationConfig:
                 hero_password=merged.get("hero_password", ""),
                 vpn_connection_name=merged.get("vpn_connection_name", ""),
                 min_price=float(merged.get("min_price", 0.01)),
-                max_price=float(merged.get("max_price", 0.15))
+                max_price=float(merged.get("max_price", 0.15)),
+                use_api=bool(merged.get("use_api", False)),
+                api_base_url=merged.get("api_base_url", ""),
+                api_key=merged.get("api_key", ""),
+                api_service_code=merged.get("api_service_code", ""),
+                api_country_code=str(merged.get("api_country_code", "0"))
             )
         except Exception as e:
             print(f"⚠️ Could not load config.json, using defaults: {e}")
@@ -825,6 +844,76 @@ def load_config() -> AutomationConfig:
 
 
 CONFIG = load_config()
+
+
+# ==========================================================================
+#  SMS PROVIDER API (sms-activate protocol) — used when CONFIG.use_api is on.
+#  Standard actions: getNumber / getStatus / setStatus. Works with
+#  sms-activate, sms-man, tiger-sms, grizzlysms and other compatible providers.
+# ==========================================================================
+def _api_call(action, extra=None):
+    import urllib.request, urllib.parse
+    params = {"api_key": CONFIG.api_key, "action": action}
+    if extra:
+        params.update(extra)
+    sep = "&" if "?" in CONFIG.api_base_url else "?"
+    url = CONFIG.api_base_url + sep + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "HeroSMS/1.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", "ignore").strip()
+
+
+def api_get_number():
+    """Order a number. Returns (activation_id, phone) or (None, None)."""
+    try:
+        resp = _api_call("getNumber", {"service": CONFIG.api_service_code,
+                                       "country": CONFIG.api_country_code})
+        print(f"🌐 [API] getNumber -> {resp}")
+        if resp.startswith("ACCESS_NUMBER"):
+            parts = resp.split(":")
+            if len(parts) >= 3:
+                return parts[1], parts[2]
+        hints = {
+            "NO_NUMBERS": "no numbers in stock for this service/country",
+            "NO_BALANCE": "top up your API balance",
+            "BAD_KEY": "wrong API key",
+            "BAD_ACTION": "wrong API base URL",
+            "BAD_SERVICE": "wrong service code",
+        }
+        print(f"🔴 [API] Could not get a number ({resp}) — { hints.get(resp, 'check API settings') }.")
+        return None, None
+    except Exception as e:
+        print(f"🔴 [API] getNumber error: {e} (check API base URL / internet)")
+        return None, None
+
+
+def api_get_code(activation_id, timeout_sec: int = 180):
+    """Poll getStatus until STATUS_OK:<code>. Returns the code or None."""
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        try:
+            resp = _api_call("getStatus", {"id": activation_id})
+            if resp.startswith("STATUS_OK"):
+                code = resp.split(":", 1)[1] if ":" in resp else ""
+                print(f"✅ [API] OTP received: {code}")
+                try:
+                    _api_call("setStatus", {"id": activation_id, "status": "6"})  # finish
+                except Exception:
+                    pass
+                return code.strip()
+            if resp == "STATUS_CANCEL":
+                print("🔴 [API] Activation cancelled by provider.")
+                return None
+            # STATUS_WAIT_CODE / other -> keep polling
+        except Exception as e:
+            print(f"⚠️ [API] getStatus error: {e}")
+        time.sleep(5)
+    print("⏳ [API] Timed out waiting for OTP; releasing the number.")
+    try:
+        _api_call("setStatus", {"id": activation_id, "status": "8"})  # cancel
+    except Exception:
+        pass
+    return None
 
 
 PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)")
@@ -2932,7 +3021,20 @@ def main() -> None:
                     time.sleep(1) 
                     
                     purchase_success = False
+                    api_activation_id = None
+                    api_phone_number = None
+                    # ---- API MODE: get the number straight from the provider's API ----
+                    if CONFIG.use_api:
+                        api_activation_id, api_phone_number = api_get_number()
+                        if not api_phone_number:
+                            print("🔴 [API] No number available. Retrying in 8s...")
+                            time.sleep(8)
+                            continue
+                        purchase_success = True  # skip the website buy flow entirely
+
                     for buy_attempt in range(1, 11):
+                        if CONFIG.use_api:
+                            break  # number already obtained via API
                         check_for_ban(hero)
                         buy_clicked = False
                         price_out_of_bounds = False
@@ -3153,15 +3255,21 @@ def main() -> None:
                         print("❌ Failed to purchase a number after 10 consecutive clicks. Restarting attempt loop...")
                         time.sleep(5)
                         continue
-                    
-                    # Navigate to Purchases page to view the new number
-                    navigate_to_purchases(hero)
-                    
-                    print("\n📱 Extracting phone number from purchases table...")
-                    phone_number = extract_phone_number(hero, CONFIG.purchased_number_selector, top_before)
-                    
-                    pyperclip.copy(phone_number)
-                    print(f"✅ Copied purchased number: {phone_number}")
+
+                    if CONFIG.use_api:
+                        # API mode: we already have the number, no website table to read
+                        phone_number = api_phone_number
+                    else:
+                        # Navigate to Purchases page to view the new number
+                        navigate_to_purchases(hero)
+                        print("\n📱 Extracting phone number from purchases table...")
+                        phone_number = extract_phone_number(hero, CONFIG.purchased_number_selector, top_before)
+
+                    try:
+                        pyperclip.copy(phone_number)
+                    except Exception:
+                        pass
+                    print(f"✅ Number ready: {phone_number}")
 
                     if not is_placeholder_url(CONFIG.target_url):
                         total_numbers_tried += 1
@@ -3250,7 +3358,11 @@ def main() -> None:
                                     print(f"⚠️ Could not bring Hero tab to front: {btf_err}")
                                 
                                 try:
-                                    sms_code = wait_for_sms_code(hero, phone_number=phone_number, fb_page=fb_page, timeout_sec=180, session_stats=session_stats)
+                                    if CONFIG.use_api:
+                                        print("🌐 [API] Waiting for the OTP from the provider API...")
+                                        sms_code = api_get_code(api_activation_id, timeout_sec=180)
+                                    else:
+                                        sms_code = wait_for_sms_code(hero, phone_number=phone_number, fb_page=fb_page, timeout_sec=180, session_stats=session_stats)
                                     total_spent += price_per_sms
                                     update_daily_stats(spent=price_per_sms)
                                     
