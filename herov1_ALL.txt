@@ -9106,7 +9106,12 @@ REM 4. Verify/install Playwright browsers
 echo Verifying Playwright browser drivers...
 playwright install chromium
 
-REM 5. Launch the Flask Web Application & Auto-Open Browser
+REM 5. Free port 5000 - close any old server still holding it so we always
+REM    launch the LATEST version (prevents connecting to a stale dashboard).
+echo Freeing port 5000 (closing any old server)...
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":5000 " ^| findstr LISTENING') do taskkill /F /PID %%p >nul 2>&1
+
+REM 6. Launch the Flask Web Application & Auto-Open Browser
 echo ===================================================
 echo   Setup complete! Launching Web UI Dashboard...
 echo ===================================================
