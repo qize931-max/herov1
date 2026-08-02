@@ -3180,6 +3180,7 @@ HTML_TEMPLATE = """
                         '<td>' + timeAgo(c.last_seen) + '</td>' +
                         '<td>' + (c.last_count || 0) + '</td>' +
                         '<td>' +
+                            '<button class="row-action" onclick="showClientKey(\\'' + c.client_id + '\\')">Key</button>' +
                             '<button class="row-action" onclick="viewClientLog(\\'' + c.client_id + '\\')">Log</button>' +
                             (c.last_count ? '<button class="row-action" onclick="downloadClient(\\'' + c.client_id + '\\')">Download</button>' : '') +
                             '<button class="row-action" onclick="toggleClient(\\'' + c.client_id + '\\')">' + toggleLabel + '</button>' +
@@ -3205,6 +3206,16 @@ HTML_TEMPLATE = """
                     document.getElementById('clients_key_box').style.display = 'block';
                     loadClients();
                 } else { setClientsMsg(d.message, false); }
+            });
+        }
+        function showClientKey(id) {
+            fetch('/api/clients/' + encodeURIComponent(id) + '/key').then(r => r.json()).then(d => {
+                if (d.key) {
+                    document.getElementById('ck_name').textContent = d.client_id;
+                    document.getElementById('ck_key').textContent = d.key;
+                    document.getElementById('clients_key_box').style.display = 'block';
+                    setClientsMsg('', true);
+                } else { setClientsMsg(d.message || 'No key found.', false); }
             });
         }
         function toggleClient(id) {

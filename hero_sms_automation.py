@@ -1317,13 +1317,23 @@ def select_service_and_country(page: Page) -> bool:
         except Exception as e_search:
             print(f"⚠️ Search input lookup skipped: {e_search}")
         
-        # Target country button - looking for list items or list elements in country drawers first
-        country_btn = page.locator(f"//li[contains(., '{CONFIG.country_text}')] | //div[@role='button' and contains(., '{CONFIG.country_text}')] | //span[contains(text(), '{CONFIG.country_text}')]").first
+        # Match the country by a CASE-INSENSITIVE PARTIAL match, because the row
+        # usually includes a flag, country code and/or price next to the name
+        # (so an exact "Philippines" match fails even when it's right there).
+        ct = CONFIG.country_text.strip()
+        ct_lower = ct.lower()
+        xpath_ci = (
+            "//li[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '%s')]"
+            " | //*[@role='button'][contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '%s')]"
+            " | //span[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '%s')]"
+        ) % (ct_lower, ct_lower, ct_lower)
+        country_btn = page.locator(xpath_ci).first
         if not country_btn.is_visible(timeout=2500):
-            # Broader fallback: Just find the exact text and click it
-            country_btn = page.get_by_text(re.compile(f"^{CONFIG.country_text}$", re.I)).first
-            if not country_btn.is_visible(timeout=2000):
-                country_btn = page.locator(f"text='{CONFIG.country_text}'").first
+            # Fallback: any element whose text CONTAINS the country name (case-insensitive)
+            country_btn = page.get_by_text(re.compile(re.escape(ct), re.I)).first
+        if not country_btn.is_visible(timeout=2000):
+            print(f"⚠️ Country '{ct}' not found in the list — it may be OUT OF STOCK for this service, "
+                  f"or Hero SMS spells it differently. Try a different country.")
              
         try:
             country_btn.evaluate("el => el.scrollIntoView({block: 'center', inline: 'center'})")
@@ -1482,10 +1492,30 @@ def wait_for_sms_code(page: Page, phone_number: str = None, fb_page: Page = None
                     print(f"✅ Received SMS Code: {code}")
                     return code
             
-            # (Tab refresh/reload disabled) — the page is only polled for the
-            # code; it is no longer refreshed, reloaded, or re-navigated while
-            # waiting for the OTP.
-
+            # Click refresh or re-navigate every ~30 seconds if still waiting
+            if time.time() - last_refresh_time > 30:
+                try:
+                    # The refresh button is usually a circular arrow icon next to the number row
+                    # We query it relative to the row content container to avoid matching header svgs
+                    refresh_btn = row.locator("button").filter(has=row.locator("svg")).first
+                    if refresh_btn.is_visible(timeout=1000):
+                        refresh_btn.click(timeout=3000)
+                        print("🔄 Clicked refresh icon for the number...")
+                    else:
+                        print("🔄 Refresh icon not found. Reloading page to force SMS update...")
+                        try:
+                            hero_tab.reload(wait_until="domcontentloaded", timeout=10000)
+                        except Exception as rel_err:
+                            print(f"⚠️ Page reload failed: {rel_err}. Trying re-navigation fallback...")
+                            navigate_to_purchases(hero_tab)
+                except Exception as ref_err:
+                    print(f"⚠️ Table refresh failed: {ref_err}. Re-navigating to Purchases...")
+                    try:
+                        navigate_to_purchases(hero_tab)
+                    except:
+                        pass
+                last_refresh_time = time.time()
+                    
         except Exception as e:
             # Ignore minor errors while polling (like row not fully loaded)
             pass
