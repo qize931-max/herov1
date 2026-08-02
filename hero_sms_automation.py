@@ -776,10 +776,11 @@ class AutomationConfig:
     # When use_api is True, the number + OTP come from the provider's API instead
     # of scraping the website. Works with sms-activate, sms-man, tiger-sms, etc.
     use_api: bool = False
-    api_base_url: str = ""      # e.g. https://api.sms-activate.org/stubs/handler_api.php
+    api_provider: str = "sms-activate"  # "sms-activate" | "claudeotp"
+    api_base_url: str = ""      # sms-activate: ...handler_api.php ; claudeotp: https://claudeotp.com/api/v1
     api_key: str = ""
-    api_service_code: str = ""  # provider's service code, e.g. "fb" for Facebook
-    api_country_code: str = "0" # provider's country code, e.g. "0"
+    api_service_code: str = ""  # service code/id (sms-activate: "fb"; claudeotp: numeric service_id)
+    api_country_code: str = "0" # country code/id (provider-specific)
 
 
 def load_config() -> AutomationConfig:
@@ -801,6 +802,7 @@ def load_config() -> AutomationConfig:
         "min_price": 0.01,
         "max_price": 0.15,
         "use_api": False,
+        "api_provider": "sms-activate",
         "api_base_url": "",
         "api_key": "",
         "api_service_code": "",
@@ -832,9 +834,10 @@ def load_config() -> AutomationConfig:
                 min_price=float(merged.get("min_price", 0.01)),
                 max_price=float(merged.get("max_price", 0.15)),
                 use_api=bool(merged.get("use_api", False)),
+                api_provider=merged.get("api_provider", "sms-activate"),
                 api_base_url=merged.get("api_base_url", ""),
                 api_key=merged.get("api_key", ""),
-                api_service_code=merged.get("api_service_code", ""),
+                api_service_code=str(merged.get("api_service_code", "")),
                 api_country_code=str(merged.get("api_country_code", "0"))
             )
         except Exception as e:
@@ -863,7 +866,7 @@ def _api_call(action, extra=None):
         return resp.read().decode("utf-8", "ignore").strip()
 
 
-def api_get_number():
+def _smsactivate_get_number():
     """Order a number. Returns (activation_id, phone) or (None, None)."""
     try:
         resp = _api_call("getNumber", {"service": CONFIG.api_service_code,
@@ -887,7 +890,7 @@ def api_get_number():
         return None, None
 
 
-def api_get_code(activation_id, timeout_sec: int = 180):
+def _smsactivate_get_code(activation_id, timeout_sec: int = 180):
     """Poll getStatus until STATUS_OK:<code>. Returns the code or None."""
     end = time.time() + timeout_sec
     while time.time() < end:
@@ -914,6 +917,117 @@ def api_get_code(activation_id, timeout_sec: int = 180):
     except Exception:
         pass
     return None
+
+
+# -------- ClaudeOTP (REST/JSON) provider --------
+def _claudeotp_call(method, path):
+    """Call a ClaudeOTP REST endpoint. apikey goes in the query string."""
+    import urllib.request, urllib.parse
+    base = CONFIG.api_base_url.rstrip("/")
+    sep = "&" if "?" in path else "?"
+    url = base + path + sep + "apikey=" + urllib.parse.quote(CONFIG.api_key)
+    data = b"" if method in ("POST", "DELETE") else None
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "HeroSMS/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8", "ignore")
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        return {"success": False, "message": raw}
+
+
+def _dig(d, *keys):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) not in (None, ""):
+            return d.get(k)
+    return None
+
+
+def _extract_code_from_order(order):
+    """Pull the OTP out of an order record, handling several shapes."""
+    direct = _dig(order, "code", "otp", "sms_code", "sms")
+    if isinstance(direct, str) and direct.strip():
+        m = re.search(r"\b(\d{3,8})\b", direct)
+        return m.group(1) if m else direct.strip()
+    msgs = order.get("sms") or order.get("messages") or order.get("smses")
+    if isinstance(msgs, list) and msgs:
+        last = msgs[-1]
+        text = last if isinstance(last, str) else str(_dig(last, "code", "otp", "text", "message", "sms") or "")
+        m = re.search(r"\b(\d{3,8})\b", text)
+        if m:
+            return m.group(1)
+        return text.strip() or None
+    return None
+
+
+def _claudeotp_get_number():
+    """POST /orders -> (order_id, phone) or (None, None)."""
+    import urllib.parse
+    try:
+        path = ("/orders?country=" + urllib.parse.quote(CONFIG.api_country_code)
+                + "&service_id=" + urllib.parse.quote(CONFIG.api_service_code))
+        res = _claudeotp_call("POST", path)
+        print(f"🌐 [API] POST /orders -> {res}")
+        if res.get("success"):
+            d = res.get("data") or {}
+            order_id = _dig(d, "id", "order_id", "orderId")
+            phone = _dig(d, "number", "phone", "phone_number", "msisdn", "phonenumber")
+            if order_id and phone:
+                return str(order_id), str(phone)
+        print(f"🔴 [API] Order failed: {res.get('message', res)}")
+        return None, None
+    except Exception as e:
+        print(f"🔴 [API] order error: {e} (check API base URL / key / balance)")
+        return None, None
+
+
+def _claudeotp_get_code(order_id, timeout_sec: int = 180):
+    """Poll GET /orders/active until our order shows a received SMS."""
+    end = time.time() + timeout_sec
+    while time.time() < end:
+        try:
+            res = _claudeotp_call("GET", "/orders/active")
+            orders = res.get("data") or []
+            if isinstance(orders, dict):
+                orders = orders.get("orders") or list(orders.values())
+            for order in orders:
+                if not isinstance(order, dict):
+                    continue
+                oid = str(_dig(order, "id", "order_id", "orderId") or "")
+                if oid == str(order_id):
+                    code = _extract_code_from_order(order)
+                    if code:
+                        print(f"✅ [API] OTP received: {code}")
+                        try:
+                            _claudeotp_call("POST", f"/orders/{order_id}/finish")
+                        except Exception:
+                            pass
+                        return code
+        except Exception as e:
+            print(f"⚠️ [API] /orders/active error: {e}")
+        time.sleep(5)
+    print("⏳ [API] Timed out waiting for OTP; cancelling order.")
+    try:
+        _claudeotp_call("DELETE", f"/orders/{order_id}")
+    except Exception:
+        pass
+    return None
+
+
+# -------- Provider dispatchers used by main() --------
+def api_get_number():
+    if CONFIG.api_provider == "claudeotp":
+        return _claudeotp_get_number()
+    return _smsactivate_get_number()
+
+
+def api_get_code(activation_id, timeout_sec: int = 180):
+    if CONFIG.api_provider == "claudeotp":
+        return _claudeotp_get_code(activation_id, timeout_sec)
+    return _smsactivate_get_code(activation_id, timeout_sec)
 
 
 PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)")

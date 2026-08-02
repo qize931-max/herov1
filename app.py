@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "hero_password": "",
     "vpn_connection_name": "",
     "use_api": False,
+    "api_provider": "sms-activate",
     "api_base_url": "",
     "api_key": "",
     "api_service_code": "",
@@ -2871,6 +2872,13 @@ HTML_TEMPLATE = """
                 </div>
                 <div id="api-fields" style="display:none; flex-direction:column; gap:0.75rem;">
                     <div class="input-group">
+                        <label style="font-size:0.75rem;">Provider</label>
+                        <select id="api_provider" onchange="onApiProviderChange()" style="padding:0.6rem 0.7rem; background:rgba(0,0,0,0.25); border:1px solid var(--border-color); border-radius:8px; color:var(--text-main); font-family:var(--font-main); outline:none;">
+                            <option value="sms-activate">sms-activate protocol (sms-activate, sms-man, tiger-sms…)</option>
+                            <option value="claudeotp">ClaudeOTP (REST API)</option>
+                        </select>
+                    </div>
+                    <div class="input-group">
                         <label style="font-size:0.75rem;">API Base URL</label>
                         <input type="text" id="api_base_url" placeholder="https://api.sms-activate.org/stubs/handler_api.php">
                     </div>
@@ -3517,6 +3525,7 @@ HTML_TEMPLATE = """
                     document.getElementById('hero_username').value = data.hero_username || '';
                     document.getElementById('hero_password').value = data.hero_password || '';
                     document.getElementById('use_api').checked = !!data.use_api;
+                    document.getElementById('api_provider').value = data.api_provider || 'sms-activate';
                     document.getElementById('api_base_url').value = data.api_base_url || '';
                     document.getElementById('api_key').value = data.api_key || '';
                     document.getElementById('api_service_code').value = data.api_service_code || '';
@@ -3529,6 +3538,18 @@ HTML_TEMPLATE = """
         function toggleApiFields() {
             const on = document.getElementById('use_api').checked;
             document.getElementById('api-fields').style.display = on ? 'flex' : 'none';
+        }
+        function onApiProviderChange() {
+            const p = document.getElementById('api_provider').value;
+            const urlEl = document.getElementById('api_base_url');
+            if (p === 'claudeotp') {
+                if (!urlEl.value || urlEl.value.indexOf('sms-activate') !== -1) urlEl.value = 'https://claudeotp.com/api/v1';
+                document.getElementById('api_service_code').placeholder = 'service_id (number, from /services)';
+                document.getElementById('api_country_code').placeholder = 'country id (number)';
+            } else {
+                document.getElementById('api_service_code').placeholder = 'fb';
+                document.getElementById('api_country_code').placeholder = '0';
+            }
         }
 
         function saveConfig(silent = false) {
@@ -3550,6 +3571,7 @@ HTML_TEMPLATE = """
                 hero_username: document.getElementById('hero_username').value,
                 hero_password: document.getElementById('hero_password').value,
                 use_api: document.getElementById('use_api').checked,
+                api_provider: document.getElementById('api_provider').value,
                 api_base_url: document.getElementById('api_base_url').value,
                 api_key: document.getElementById('api_key').value,
                 api_service_code: document.getElementById('api_service_code').value,
