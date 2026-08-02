@@ -1482,30 +1482,10 @@ def wait_for_sms_code(page: Page, phone_number: str = None, fb_page: Page = None
                     print(f"✅ Received SMS Code: {code}")
                     return code
             
-            # Click refresh or re-navigate every ~30 seconds if still waiting
-            if time.time() - last_refresh_time > 30:
-                try:
-                    # The refresh button is usually a circular arrow icon next to the number row
-                    # We query it relative to the row content container to avoid matching header svgs
-                    refresh_btn = row.locator("button").filter(has=row.locator("svg")).first
-                    if refresh_btn.is_visible(timeout=1000):
-                        refresh_btn.click(timeout=3000)
-                        print("🔄 Clicked refresh icon for the number...")
-                    else:
-                        print("🔄 Refresh icon not found. Reloading page to force SMS update...")
-                        try:
-                            hero_tab.reload(wait_until="domcontentloaded", timeout=10000)
-                        except Exception as rel_err:
-                            print(f"⚠️ Page reload failed: {rel_err}. Trying re-navigation fallback...")
-                            navigate_to_purchases(hero_tab)
-                except Exception as ref_err:
-                    print(f"⚠️ Table refresh failed: {ref_err}. Re-navigating to Purchases...")
-                    try:
-                        navigate_to_purchases(hero_tab)
-                    except:
-                        pass
-                last_refresh_time = time.time()
-                    
+            # (Tab refresh/reload disabled) — the page is only polled for the
+            # code; it is no longer refreshed, reloaded, or re-navigated while
+            # waiting for the OTP.
+
         except Exception as e:
             # Ignore minor errors while polling (like row not fully loaded)
             pass
