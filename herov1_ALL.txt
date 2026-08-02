@@ -42,6 +42,8 @@ instances/
 client_keys.json
 Client_Recoveries/
 client_builds/
+client_keys.json.bak
+client_keys.json.tmp
 
 
 ==================================================
@@ -7814,45 +7816,66 @@ def main() -> None:
                             print("🔄 Re-selecting service and country after server error recovery...")
                             select_service_and_country(hero)
                         
-                        # 1. Search text candidates
-                        for candidate in buy_candidates:
+                        # 1. Scan ALL buy buttons and pick the FIRST one whose price
+                        #    is within the acceptable range — not just the first button
+                        #    on the page (which may be pricier than others available).
+                        try:
+                            all_buy = hero.locator(
+                                "button:has-text('Buy'), a:has-text('Buy'), "
+                                "div[role='button']:has-text('Buy'), .v-btn:has-text('Buy')"
+                            )
+                            n_buy = all_buy.count()
+                        except Exception:
+                            n_buy = 0
+
+                        chosen_btn = None
+                        chosen_price = 0.0
+                        prices_seen = []
+                        for i in range(min(n_buy, 50)):
                             try:
-                                btn = hero.locator(f"button:has-text('{candidate}'), a:has-text('{candidate}'), div[role='button']:has-text('{candidate}'), .v-btn:has-text('{candidate}')").first
-                                if btn.is_visible(timeout=1500):
-                                    # Verify price range
-                                    price_ok, parsed_price = check_price_range(btn, min_price_config, max_price_config)
-                                    if not price_ok:
-                                        print(f"🛑 Skipping purchase because price {parsed_price:.3f} USD is outside acceptable range (${min_price_config:.3f} - ${max_price_config:.3f} USD).")
-                                        price_out_of_bounds = True
+                                cand_btn = all_buy.nth(i)
+                                if not cand_btn.is_visible(timeout=400):
+                                    continue
+                                ok, pr = check_price_range(cand_btn, min_price_config, max_price_config)
+                                if pr > 0:
+                                    prices_seen.append(pr)
+                                    if ok:  # a real, parsed price within range
+                                        chosen_btn = cand_btn
+                                        chosen_price = pr
                                         break
-                                        
-                                    if parsed_price > 0:
-                                        price_per_sms = parsed_price
-                                        
-                                    print(f"🎯 Found visible buy button: '{candidate}' (Price: {price_per_sms:.3f} USD). Clicking it (attempt {buy_attempt}/10)...")
-                                    try:
-                                        btn.evaluate("el => el.scrollIntoView({block: 'center', inline: 'center'})")
-                                        time.sleep(0.2)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        btn.click(timeout=3000)
-                                    except Exception:
-                                        try:
-                                            btn.click(timeout=3000, force=True)
-                                        except Exception:
-                                            btn.evaluate("el => el.click()")
-                                    try:
-                                        hero.wait_for_load_state("domcontentloaded", timeout=2000)
-                                    except Exception:
-                                        pass
-                                    buy_clicked = True
-                                    break
-                            except Exception as e:
-                                click_err = e
-                                
+                            except Exception:
+                                continue
+
+                        if chosen_btn is not None:
+                            if chosen_price > 0:
+                                price_per_sms = chosen_price
+                            print(f"🎯 Buying a number at ${chosen_price:.3f} (within ${min_price_config:.3f} - ${max_price_config:.3f}) (attempt {buy_attempt}/10)...")
+                            try:
+                                chosen_btn.evaluate("el => el.scrollIntoView({block: 'center', inline: 'center'})")
+                                time.sleep(0.2)
+                            except Exception:
+                                pass
+                            try:
+                                chosen_btn.click(timeout=3000)
+                            except Exception:
+                                try:
+                                    chosen_btn.click(timeout=3000, force=True)
+                                except Exception:
+                                    chosen_btn.evaluate("el => el.click()")
+                            try:
+                                hero.wait_for_load_state("domcontentloaded", timeout=2000)
+                            except Exception:
+                                pass
+                            buy_clicked = True
+                        elif prices_seen:
+                            cheapest = min(prices_seen)
+                            print(f"🛑 All {len(prices_seen)} available number(s) are OUTSIDE your price range "
+                                  f"(${min_price_config:.3f} - ${max_price_config:.3f} USD). Cheapest available is ${cheapest:.3f}. "
+                                  f"Raise 'Max Price' above ${cheapest:.3f} to buy.")
+                            price_out_of_bounds = True
+
                         if price_out_of_bounds:
-                            print("⏳ Price limit block hit. Retrying country/service selection in 10 seconds...")
+                            print("⏳ No number within your price range right now. Retrying in 10 seconds...")
                             time.sleep(10)
                             break
                                 
