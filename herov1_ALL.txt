@@ -1230,25 +1230,60 @@ background:rgba(239,68,68,.08)}h1{color:#fca5a5;font-size:1.3rem}p{color:#9ca3af
 """
 
 
+# Guards every read-modify-write of client_keys.json so concurrent client
+# check-ins can't corrupt or wipe the list. RLock = safe to nest (mutators call
+# save while holding it).
+_client_keys_lock = threading.RLock()
+
+
 def load_client_keys():
-    if os.path.exists(CLIENT_KEYS_PATH):
-        try:
-            with open(CLIENT_KEYS_PATH, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            if isinstance(d, list):
-                return d
-        except Exception:
-            pass
-    return []
+    with _client_keys_lock:
+        for path in (CLIENT_KEYS_PATH, CLIENT_KEYS_PATH + ".bak"):
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if isinstance(d, list):
+                        return d
+                except Exception:
+                    # Corrupted primary -> fall through to the .bak backup
+                    continue
+        return []
 
 
 def save_client_keys(items):
-    try:
-        with open(CLIENT_KEYS_PATH, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=4)
-        return True
-    except Exception:
+    # Only save a real list, and never blow away existing data with an empty
+    # list unless the file was already empty (guards against a transient bad read).
+    if not isinstance(items, list):
         return False
+    with _client_keys_lock:
+        try:
+            if not items and os.path.exists(CLIENT_KEYS_PATH):
+                # Refuse to overwrite existing clients with nothing
+                try:
+                    with open(CLIENT_KEYS_PATH, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                    if isinstance(existing, list) and existing:
+                        return False
+                except Exception:
+                    pass
+            # Keep a backup of the last good file
+            if os.path.exists(CLIENT_KEYS_PATH):
+                try:
+                    import shutil
+                    shutil.copy2(CLIENT_KEYS_PATH, CLIENT_KEYS_PATH + ".bak")
+                except Exception:
+                    pass
+            # Atomic write: write to a temp file, fsync, then replace
+            tmp = CLIENT_KEYS_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(items, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, CLIENT_KEYS_PATH)
+            return True
+        except Exception:
+            return False
 
 
 def find_client_key(cid):
@@ -1327,13 +1362,14 @@ def api_collect():
             _log_client_event(cid, f"Recovered {total - prev_total} new account(s) — total {total}")
     except Exception as e:
         return jsonify({"status": "error", "message": f"Save failed: {e}"}), 500
-    # Update last-seen / cumulative count
-    items = load_client_keys()
-    for it in items:
-        if it.get("client_id", "").lower() == cid.lower():
-            it["last_seen"] = int(time.time())
-            it["last_count"] = total
-    save_client_keys(items)
+    # Update last-seen / cumulative count (atomic under the lock)
+    with _client_keys_lock:
+        items = load_client_keys()
+        for it in items:
+            if it.get("client_id", "").lower() == cid.lower():
+                it["last_seen"] = int(time.time())
+                it["last_count"] = total
+        save_client_keys(items)
     return jsonify({"status": "success", "enabled": True})
 
 
@@ -1361,13 +1397,14 @@ def api_clients_create():
     cid = (data.get("client_id") or "").strip()
     if not re.match(r'^[A-Za-z0-9_-]{1,30}$', cid):
         return jsonify({"status": "error", "message": "Name must be 1-30 chars: letters, numbers, - or _."}), 400
-    if find_client_key(cid):
-        return jsonify({"status": "error", "message": "That client already exists."}), 400
     key = secrets.token_hex(16)
-    items = load_client_keys()
-    items.append({"client_id": cid, "key": key, "enabled": True,
-                  "created_at": int(time.time()), "last_seen": 0, "last_count": 0})
-    save_client_keys(items)
+    with _client_keys_lock:
+        if find_client_key(cid):
+            return jsonify({"status": "error", "message": "That client already exists."}), 400
+        items = load_client_keys()
+        items.append({"client_id": cid, "key": key, "enabled": True,
+                      "created_at": int(time.time()), "last_seen": 0, "last_count": 0})
+        save_client_keys(items)
     return jsonify({"status": "success", "message": f"Client '{cid}' created.", "client_id": cid, "key": key})
 
 
@@ -1375,12 +1412,13 @@ def api_clients_create():
 @owner_required
 @manager_required
 def api_clients_toggle(cid):
-    items = load_client_keys()
-    target = next((c for c in items if c.get("client_id", "").lower() == cid.lower()), None)
-    if not target:
-        return jsonify({"status": "error", "message": "Client not found."}), 404
-    target["enabled"] = not target.get("enabled", True)
-    save_client_keys(items)
+    with _client_keys_lock:
+        items = load_client_keys()
+        target = next((c for c in items if c.get("client_id", "").lower() == cid.lower()), None)
+        if not target:
+            return jsonify({"status": "error", "message": "Client not found."}), 404
+        target["enabled"] = not target.get("enabled", True)
+        save_client_keys(items)
     state = "enabled" if target["enabled"] else "disabled"
     _log_client_event(cid, f"{state.capitalize()} by owner")
     return jsonify({"status": "success", "message": f"Client '{cid}' {state}.", "enabled": target["enabled"]})
@@ -1390,10 +1428,14 @@ def api_clients_toggle(cid):
 @owner_required
 @manager_required
 def api_clients_delete(cid):
-    items = load_client_keys()
-    if not any(c.get("client_id", "").lower() == cid.lower() for c in items):
-        return jsonify({"status": "error", "message": "Client not found."}), 404
-    save_client_keys([c for c in items if c.get("client_id", "").lower() != cid.lower()])
+    with _client_keys_lock:
+        items = load_client_keys()
+        if not any(c.get("client_id", "").lower() == cid.lower() for c in items):
+            return jsonify({"status": "error", "message": "Client not found."}), 404
+        remaining = [c for c in items if c.get("client_id", "").lower() != cid.lower()]
+        # Deleting the last client legitimately empties the file; write directly
+        with open(CLIENT_KEYS_PATH, "w", encoding="utf-8") as f:
+            json.dump(remaining, f, indent=4)
     return jsonify({"status": "success", "message": f"Client '{cid}' deleted."})
 
 
