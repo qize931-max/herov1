@@ -42,8 +42,6 @@ instances/
 client_keys.json
 Client_Recoveries/
 client_builds/
-client_keys.json.bak
-client_keys.json.tmp
 
 
 ==================================================
