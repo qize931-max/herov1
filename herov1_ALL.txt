@@ -784,10 +784,24 @@ def run_automation_process():
             env=env
         )
         
-        # Read stdout line by line
+        # Read stdout line by line (also mirror to automation.log for debugging)
+        try:
+            _autolog = open(os.path.join(BASE_DIR, "automation.log"), "w", encoding="utf-8")
+        except Exception:
+            _autolog = None
         for line in iter(process.stdout.readline, ''):
             log_queue.put(line)
-            
+            if _autolog is not None:
+                try:
+                    _autolog.write(line); _autolog.flush()
+                except Exception:
+                    pass
+        if _autolog is not None:
+            try:
+                _autolog.close()
+            except Exception:
+                pass
+
         process.stdout.close()
         process.wait()
         
@@ -5913,19 +5927,65 @@ def _extract_code_from_order(order):
     return None
 
 
+def _claudeotp_resolve_country_id(service_id, pref):
+    """Resolve the ClaudeOTP order 'country' id. `pref` may be an exact order
+    country-id (e.g. 146576), a country name ('Philippines'), or ISO ('PH').
+    Picks the cheapest in-stock, orderable option. This is required because the
+    order endpoint needs the per-operator id from /services/<id>/countries, NOT
+    the generic country id."""
+    import urllib.parse
+    try:
+        res = _claudeotp_call("GET", "/services/" + urllib.parse.quote(str(service_id)) + "/countries")
+        countries = ((res.get("data") or {}).get("countries")) or []
+    except Exception:
+        countries = []
+    if not countries:
+        return str(pref)
+    p = str(pref).strip()
+    pl = p.lower()
+    # 1) exact order-id match -> use as-is
+    for c in countries:
+        if str(c.get("id")) == p:
+            return p
+    # 2) name / ISO match -> cheapest in-stock & orderable
+    matches = [c for c in countries
+               if c.get("can_order") and (c.get("stock") or 0) > 0 and pl
+               and (pl in str(c.get("name", "")).lower() or pl == str(c.get("iso", "")).lower())]
+    if matches:
+        best = min(matches, key=lambda c: c.get("price") or 1e12)
+        print(f"🌐 [API] Picked {best.get('name')} · {best.get('operator')} · "
+              f"stock {best.get('stock')} · {best.get('price_formatted')} (order id {best.get('id')})")
+        return str(best.get("id"))
+    print(f"🔴 [API] No in-stock option matched country '{pref}' for service {service_id}.")
+    return str(pref)
+
+
 def _claudeotp_get_number():
     """POST /orders -> (order_id, phone) or (None, None)."""
     import urllib.parse
     try:
-        path = ("/orders?country=" + urllib.parse.quote(CONFIG.api_country_code)
-                + "&service_id=" + urllib.parse.quote(CONFIG.api_service_code))
+        country_id = _claudeotp_resolve_country_id(CONFIG.api_service_code, CONFIG.api_country_code)
+        path = ("/orders?country=" + urllib.parse.quote(str(country_id))
+                + "&service_id=" + urllib.parse.quote(str(CONFIG.api_service_code)))
         res = _claudeotp_call("POST", path)
-        print(f"🌐 [API] POST /orders -> {res}")
+        print(f"🌐 [API] POST /orders -> {str(res)[:300]}")
         if res.get("success"):
             d = res.get("data") or {}
-            order_id = _dig(d, "id", "order_id", "orderId")
-            phone = _dig(d, "number", "phone", "phone_number", "msisdn", "phonenumber")
+            # The real response nests the order under data.results[0].order
+            order = None
+            results = d.get("results")
+            if isinstance(results, list) and results and isinstance(results[0], dict):
+                order = results[0].get("order") or results[0]
+            if not isinstance(order, dict):
+                order = d.get("order") or d
+            order_id = _dig(order, "id", "order_id", "orderId")
+            num = order.get("number") if isinstance(order, dict) else None
+            if isinstance(num, dict):
+                phone = _dig(num, "value", "formatted")
+            else:
+                phone = num or _dig(order, "phone", "phone_number", "msisdn", "phonenumber")
             if order_id and phone:
+                print(f"✅ [API] Got number {phone} (order {order_id})")
                 return str(order_id), str(phone)
         print(f"🔴 [API] Order failed: {res.get('message', res)}")
         return None, None
@@ -7843,71 +7903,74 @@ def main() -> None:
             # Skip auto-login - user logs in manually
             print("\n[OK] Make sure you are already logged into Hero SMS in Chrome")
             
-            hero = find_or_open_page(context, CONFIG.hero_url)
+            hero = find_or_open_page(context, "about:blank" if CONFIG.use_api else CONFIG.hero_url)
             hero.bring_to_front()
             
-            print("\n⏳ Verifying Hero SMS login status...")
-            try:
-                # Check for common login indicators
-                login_btn = hero.locator("a:has-text('Login / Register'), button:has-text('Log in')").first
-                login_title = hero.get_by_text(re.compile("Log in to your account", re.I)).first
-                
-                if login_btn.is_visible(timeout=3000) or login_title.is_visible(timeout=1000):
-                    print("\n❌ You are NOT logged into Hero SMS!")
-                    
-                    # Check if auto_login is configured
-                    if getattr(CONFIG, 'auto_login', False):
-                        print("🤖 Auto-login is enabled. Running auto-login handler...")
-                        try:
-                            login_if_needed(context)
-                        except Exception as ae:
-                            print(f"⚠️ Auto-login handler encountered an error: {ae}")
-                        
-                    # Double-check status after auto-login handler run
-                    if login_btn.is_visible(timeout=2000) or login_title.is_visible(timeout=1000):
-                        if login_btn.is_visible():
-                            print("🖱️ Auto-clicking 'Login / Register' to open the popup...")
-                            try:
-                                login_btn.click(timeout=2000)
-                                time.sleep(1)
-                            except Exception:
-                                pass
-                        
-                        print("🛑 Auto-login could not complete (e.g. Cloudflare check needed). Please log in manually.")
-                        print("⏳ The script will automatically resume once you are logged in and the 'Login / Register' button disappears...")
-                        
-                        # Wait for manual login fallback
-                        if login_btn.is_visible():
-                            login_btn.wait_for(state="hidden", timeout=300_000) # Wait up to 5 mins
-                        else:
-                            login_title.wait_for(state="hidden", timeout=300_000)
-                            
-                        print("\n✅ Login confirmed! Resuming automation...")
-                        time.sleep(2) # Give the dashboard a moment to load
-                    else:
-                        print("\n✅ Auto-login verified! Resuming automation...")
-                else:
-                    print("✅ You are logged in!")
-            except Exception as e:
-                # Check login buttons again to be sure
+            if CONFIG.use_api:
+                print("\n🌐 API mode ON — skipping hero-sms.com login/navigation (number + OTP come from the provider API).")
+            else:
+                print("\n⏳ Verifying Hero SMS login status...")
                 try:
-                    if login_btn.is_visible(timeout=1000):
-                        print(f"❌ Verification failed and login button is still visible: {e}")
-                        raise e
-                except:
+                    # Check for common login indicators
+                    login_btn = hero.locator("a:has-text('Login / Register'), button:has-text('Log in')").first
+                    login_title = hero.get_by_text(re.compile("Log in to your account", re.I)).first
+
+                    if login_btn.is_visible(timeout=3000) or login_title.is_visible(timeout=1000):
+                        print("\n❌ You are NOT logged into Hero SMS!")
+
+                        # Check if auto_login is configured
+                        if getattr(CONFIG, 'auto_login', False):
+                            print("🤖 Auto-login is enabled. Running auto-login handler...")
+                            try:
+                                login_if_needed(context)
+                            except Exception as ae:
+                                print(f"⚠️ Auto-login handler encountered an error: {ae}")
+
+                        # Double-check status after auto-login handler run
+                        if login_btn.is_visible(timeout=2000) or login_title.is_visible(timeout=1000):
+                            if login_btn.is_visible():
+                                print("🖱️ Auto-clicking 'Login / Register' to open the popup...")
+                                try:
+                                    login_btn.click(timeout=2000)
+                                    time.sleep(1)
+                                except Exception:
+                                    pass
+
+                            print("🛑 Auto-login could not complete (e.g. Cloudflare check needed). Please log in manually.")
+                            print("⏳ The script will automatically resume once you are logged in and the 'Login / Register' button disappears...")
+
+                            # Wait for manual login fallback
+                            if login_btn.is_visible():
+                                login_btn.wait_for(state="hidden", timeout=300_000) # Wait up to 5 mins
+                            else:
+                                login_title.wait_for(state="hidden", timeout=300_000)
+
+                            print("\n✅ Login confirmed! Resuming automation...")
+                            time.sleep(2) # Give the dashboard a moment to load
+                        else:
+                            print("\n✅ Auto-login verified! Resuming automation...")
+                    else:
+                        print("✅ You are logged in!")
+                except Exception as e:
+                    # Check login buttons again to be sure
+                    try:
+                        if login_btn.is_visible(timeout=1000):
+                            print(f"❌ Verification failed and login button is still visible: {e}")
+                            raise e
+                    except:
+                        pass
+                    print("✅ You are logged in!")
+
+                print("\n🔍 Ensuring the 'Purchases' page is visible...")
+                try:
+                    # Look for a navigation link to 'My purchases' or 'Purchases'
+                    purchases_btn = hero.locator("a:has-text('My purchases'), a:has-text('Purchases'), button:has-text('My purchases')").first
+                    if purchases_btn.is_visible(timeout=2000):
+                        purchases_btn.click()
+                        time.sleep(2) # Give the table time to load
+                        print("✅ Navigated to Purchases page.")
+                except Exception:
                     pass
-                print("✅ You are logged in!")
-                
-            print("\n🔍 Ensuring the 'Purchases' page is visible...")
-            try:
-                # Look for a navigation link to 'My purchases' or 'Purchases'
-                purchases_btn = hero.locator("a:has-text('My purchases'), a:has-text('Purchases'), button:has-text('My purchases')").first
-                if purchases_btn.is_visible(timeout=2000):
-                    purchases_btn.click()
-                    time.sleep(2) # Give the table time to load
-                    print("✅ Navigated to Purchases page.")
-            except Exception:
-                pass
 
             fb_browser = None
             fb_port = None
@@ -7935,7 +7998,7 @@ def main() -> None:
                         time.sleep(1)
                         profile_name = getattr(CONFIG, 'chrome_profile_name', "Default")
                         browser, context, is_standalone = launch_and_connect_chrome(p, active_port, profile_name, user_data_subdir="chrome_profiles_hero")
-                        hero = find_or_open_page(context, CONFIG.hero_url)
+                        hero = find_or_open_page(context, "about:blank" if CONFIG.use_api else CONFIG.hero_url)
                         hero.bring_to_front()
                 except Exception as conn_err:
                     print(f"\n⚠️ Connection verification failed: {conn_err}. Re-launching Chrome...")
@@ -7948,7 +8011,7 @@ def main() -> None:
                         time.sleep(1)
                         profile_name = getattr(CONFIG, 'chrome_profile_name', "Default")
                         browser, context, is_standalone = launch_and_connect_chrome(p, active_port, profile_name, user_data_subdir="chrome_profiles_hero")
-                        hero = find_or_open_page(context, CONFIG.hero_url)
+                        hero = find_or_open_page(context, "about:blank" if CONFIG.use_api else CONFIG.hero_url)
                         hero.bring_to_front()
                     except Exception as relaunch_err:
                         print(f"❌ Failed to re-launch Chrome: {relaunch_err}. Waiting 10 seconds before retrying...")
@@ -8051,23 +8114,28 @@ def main() -> None:
                             attempt += 1
                             continue
 
-                    # 2. Now that the profile is confirmed clean and ready, proceed to buy a number!
-                    # Navigate to Purchases page to note the current top number before buying
-                    navigate_to_purchases(hero)
-                    top_before = get_top_number(hero)
-                    
-                    # Navigate to Get code page
-                    if not navigate_to_get_code(hero):
-                        print("🔴 Aborting this attempt because we could not navigate to Get code page.")
-                        time.sleep(3)
-                        continue
-                    
-                    # Ensure service and country are selected (in case of page refresh)
-                    selection_success = select_service_and_country(hero)
-                    if not selection_success:
-                        print("🔴 Aborting this attempt because service/country could not be selected.")
-                        time.sleep(3)
-                        continue
+                    # 2. Get a number. Website mode buys it on hero-sms.com;
+                    #    API mode skips the website entirely (number from provider API).
+                    top_before = None
+                    if not CONFIG.use_api:
+                        # Navigate to Purchases page to note the current top number before buying
+                        navigate_to_purchases(hero)
+                        top_before = get_top_number(hero)
+
+                        # Navigate to Get code page
+                        if not navigate_to_get_code(hero):
+                            print("🔴 Aborting this attempt because we could not navigate to Get code page.")
+                            time.sleep(3)
+                            continue
+
+                        # Ensure service and country are selected (in case of page refresh)
+                        selection_success = select_service_and_country(hero)
+                        if not selection_success:
+                            print("🔴 Aborting this attempt because service/country could not be selected.")
+                            time.sleep(3)
+                            continue
+                    else:
+                        print("\n🌐 API mode — getting the number from the provider API (skipping hero-sms.com)...")
                     
                     # Dynamically determine valid buy button candidate texts to search
                     buy_candidates = []
@@ -8416,7 +8484,7 @@ def main() -> None:
                                 print("\n🔄 Checking Hero SMS tab to wait for code...")
                                 try:
                                     if hero.is_closed():
-                                        hero = find_or_open_page(context, CONFIG.hero_url)
+                                        hero = find_or_open_page(context, "about:blank" if CONFIG.use_api else CONFIG.hero_url)
                                     hero.bring_to_front()
                                 except Exception as btf_err:
                                     print(f"⚠️ Could not bring Hero tab to front: {btf_err}")

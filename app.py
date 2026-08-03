@@ -542,10 +542,24 @@ def run_automation_process():
             env=env
         )
         
-        # Read stdout line by line
+        # Read stdout line by line (also mirror to automation.log for debugging)
+        try:
+            _autolog = open(os.path.join(BASE_DIR, "automation.log"), "w", encoding="utf-8")
+        except Exception:
+            _autolog = None
         for line in iter(process.stdout.readline, ''):
             log_queue.put(line)
-            
+            if _autolog is not None:
+                try:
+                    _autolog.write(line); _autolog.flush()
+                except Exception:
+                    pass
+        if _autolog is not None:
+            try:
+                _autolog.close()
+            except Exception:
+                pass
+
         process.stdout.close()
         process.wait()
         
