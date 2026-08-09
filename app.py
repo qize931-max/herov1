@@ -1285,6 +1285,112 @@ def api_activity():
     return jsonify({"summary": summary, "events": events[:500]})
 
 
+def _collect_recovery_events():
+    """Return a list of (datetime, delta, folder_name) for every 'Recovered N'
+    line across all clients' activity logs — the exact recovery history."""
+    from datetime import datetime
+    out = []
+    if not os.path.isdir(COLLECTOR_DIR):
+        return out
+    for name in os.listdir(COLLECTOR_DIR):
+        logpath = os.path.join(COLLECTOR_DIR, name, "activity.log")
+        if not os.path.exists(logpath):
+            continue
+        try:
+            with open(logpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*Recovered\s+(\d+)\s+new', line)
+                    if m:
+                        try:
+                            dt = datetime.strptime(m.group(1), '%Y-%m-%d %H:%M:%S')
+                            out.append((dt, int(m.group(2)), name))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return out
+
+
+@app.route('/api/tracking', methods=['GET'])
+@owner_required
+@manager_required
+def api_tracking():
+    """EXACT recovery tracking for a time range: total recovered, active clients,
+    per-client recovered, and per-bucket counts (no averages, real counts)."""
+    from datetime import datetime, timedelta
+    rng = (request.args.get('range') or '7days').strip()
+    now = datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if rng == 'today':
+        start, end, unit = midnight, now, 'hour'
+    elif rng == 'yesterday':
+        end = midnight; start = midnight - timedelta(days=1); unit = 'hour'
+    elif rng == '3days':
+        start = midnight - timedelta(days=2); end = now; unit = 'day'
+    elif rng == '1month':
+        start = midnight - timedelta(days=29); end = now; unit = 'day'
+    else:
+        rng = '7days'; start = midnight - timedelta(days=6); end = now; unit = 'day'
+
+    events = [(dt, d, name) for (dt, d, name) in _collect_recovery_events() if start <= dt <= end]
+
+    # per-client recovered in range (keyed by folder name)
+    per_folder = {}
+    for dt, d, name in events:
+        per_folder[name] = per_folder.get(name, 0) + d
+
+    # buckets (exact counts)
+    buckets = []
+    if unit == 'hour':
+        cur = start
+        while cur <= end:
+            nxt = cur + timedelta(hours=1)
+            cnt = sum(d for (dt, d, _) in events if cur <= dt < nxt)
+            h = cur.hour
+            label = f"{(h % 12) or 12}{'a' if h < 12 else 'p'}"
+            buckets.append({"label": label, "count": cnt})
+            cur = nxt
+    else:
+        ndays = (end.date() - start.date()).days + 1
+        for i in range(ndays):
+            day = start + timedelta(days=i)
+            nxt = day + timedelta(days=1)
+            cnt = sum(d for (dt, d, _) in events if day <= dt < nxt)
+            label = day.strftime('%a') if rng in ('3days', '7days') else f"{day.month}/{day.day}"
+            buckets.append({"label": label, "count": cnt})
+
+    total = sum(b["count"] for b in buckets)
+
+    keys = load_client_keys()
+    clients, active = [], 0
+    for c in keys:
+        cid = c.get("client_id", "")
+        last_seen = int(c.get("last_seen", 0) or 0)
+        seen_dt = datetime.fromtimestamp(last_seen) if last_seen else None
+        in_range = bool(seen_dt and start <= seen_dt <= end)
+        if c.get("enabled", True) and in_range:
+            active += 1
+        clients.append({
+            "client_id": cid,
+            "enabled": c.get("enabled", True),
+            "last_seen": last_seen,
+            "recovered": per_folder.get(_safe_client_folder(cid), 0),
+            "total": int(c.get("last_count", 0)),
+        })
+    clients.sort(key=lambda x: -x["recovered"])
+
+    return jsonify({
+        "range": rng,
+        "recovered": total,
+        "active": active,
+        "total_clients": len(keys),
+        "all_time": sum(int(c.get("last_count", 0)) for c in keys),
+        "buckets": buckets,
+        "clients": clients,
+    })
+
+
 def _client_stop_bot():
     try:
         if is_running:
@@ -2596,6 +2702,19 @@ HTML_TEMPLATE = """
         .modal-msg { font-size: 0.82rem; min-height: 1.1rem; margin-bottom: 0.6rem; }
         .modal-msg.ok { color: #6ee7b7; }
         .modal-msg.err { color: #fca5a5; }
+        /* ===== Tracking dashboard ===== */
+        .trk-seg { display:inline-flex; background:rgba(0,0,0,0.25); border:1px solid var(--border-color); border-radius:11px; padding:4px; gap:2px; flex-wrap:wrap; }
+        .trk-seg button { appearance:none; border:0; background:transparent; color:var(--text-muted); font-family:var(--font-main); font-size:0.8rem; font-weight:500; padding:7px 13px; border-radius:8px; cursor:pointer; transition:.15s; }
+        .trk-seg button:hover { color:var(--text-main); }
+        .trk-seg button.on { background:linear-gradient(180deg,var(--primary-glow),var(--primary-glow-hover)); color:#fff; box-shadow:0 4px 12px rgba(79,70,229,.35); }
+        .trk-kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:1rem; }
+        .trk-kpi { background:linear-gradient(180deg,rgba(255,255,255,0.03),rgba(255,255,255,0.01)); border:1px solid var(--border-color); border-radius:12px; padding:13px 15px; }
+        .trk-kpi .k { font-size:0.66rem; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); }
+        .trk-kpi .v { font-size:1.9rem; font-weight:680; letter-spacing:-.02em; margin-top:6px; line-height:1; font-variant-numeric:tabular-nums; }
+        .trk-kpi .s { font-size:0.7rem; color:var(--text-muted); margin-top:5px; opacity:.8; }
+        .trk-kpi.good .v { color:#5eead4; } .trk-kpi.accent .v { color:#c7cbff; }
+        .trk-av { width:30px; height:30px; border-radius:9px; display:inline-grid; place-items:center; font-weight:650; font-size:0.72rem; color:#fff; font-family:var(--font-mono); vertical-align:middle; margin-right:9px; }
+        @media (max-width:640px){ .trk-kpis { grid-template-columns:repeat(2,1fr); } }
     </style>
 </head>
 <body>
@@ -2627,9 +2746,9 @@ HTML_TEMPLATE = """
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 15a4 4 0 004 4h9a5 5 0 001-9.9A5 5 0 007 8a4 4 0 00-4 4 3 3 0 000 3z"/></svg>
                 Clients
             </button>
-            <button onclick="openActivityModal()" class="header-btn" title="Activity log across all clients">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 17v-6h13M9 5h13M5 5h.01M5 12h.01M5 19h.01"/></svg>
-                Activity
+            <button onclick="openActivityModal()" class="header-btn" title="Tracking — recoveries by day / week / month">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3 3v18h18M7 14l3-4 3 3 4-6"/></svg>
+                Tracking
             </button>
             {% endif %}
             {% if is_admin %}
@@ -2738,30 +2857,54 @@ HTML_TEMPLATE = """
 
     <!-- ===== Global activity dashboard modal (owner) ===== -->
     <div id="activityModal" class="modal-overlay" onclick="if(event.target===this)closeActivityModal()">
-        <div class="modal-box" style="max-width:720px;">
+        <div class="modal-box" style="max-width:920px;">
             <div class="modal-header">
-                <h2>Activity — all clients</h2>
+                <h2>Tracking</h2>
                 <button class="modal-close" onclick="closeActivityModal()">&times;</button>
             </div>
             <div class="modal-body">
-                <div style="display:flex;gap:0.75rem;margin-bottom:1rem;flex-wrap:wrap;">
-                    <div style="flex:1;min-width:120px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);border-radius:10px;padding:0.7rem 0.9rem;">
-                        <div style="font-size:1.4rem;font-weight:700;" id="act_clients">0</div>
-                        <div style="font-size:0.72rem;color:var(--text-muted);">CLIENTS</div>
+                <!-- range switcher -->
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:1rem;">
+                    <div class="trk-seg" id="trkSeg">
+                        <button data-r="today">Today</button>
+                        <button data-r="yesterday">Yesterday</button>
+                        <button data-r="3days">3 days</button>
+                        <button data-r="7days" class="on">7 days</button>
+                        <button data-r="1month">1 month</button>
                     </div>
-                    <div style="flex:1;min-width:120px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.25);border-radius:10px;padding:0.7rem 0.9rem;">
-                        <div style="font-size:1.4rem;font-weight:700;color:#6ee7b7;" id="act_active">0</div>
-                        <div style="font-size:0.72rem;color:var(--text-muted);">ACTIVE</div>
+                    <div style="font-size:0.78rem;color:var(--text-muted);">Showing <b id="trkRangeName" style="color:var(--text-main);">last 7 days</b></div>
+                </div>
+                <!-- KPIs (exact) -->
+                <div class="trk-kpis">
+                    <div class="trk-kpi"><div class="k">Recovered</div><div class="v" id="trkRecov">0</div><div class="s" id="trkRecovSub">in the last 7 days</div></div>
+                    <div class="trk-kpi good"><div class="k">Active clients</div><div class="v" id="trkActive">0</div><div class="s">checked in this period</div></div>
+                    <div class="trk-kpi"><div class="k">Total clients</div><div class="v" id="trkClients">0</div><div class="s">registered</div></div>
+                    <div class="trk-kpi accent"><div class="k">All-time recovered</div><div class="v" id="trkAll">0</div><div class="s">every client, ever</div></div>
+                </div>
+                <!-- recoveries chart -->
+                <div class="glass-panel" style="padding:0;margin-bottom:1rem;">
+                    <div style="display:flex;align-items:center;justify-content:space-between;padding:0.7rem 1rem;border-bottom:1px solid var(--border-color);">
+                        <div style="font-size:0.82rem;font-weight:600;">Recoveries</div>
+                        <div style="font-size:0.72rem;color:var(--text-muted);" id="trkChartMeta">last 7 days</div>
                     </div>
-                    <div style="flex:1;min-width:120px;background:rgba(99,102,241,0.08);border:1px solid rgba(99,102,241,0.3);border-radius:10px;padding:0.7rem 0.9rem;">
-                        <div style="font-size:1.4rem;font-weight:700;color:#a5b4fc;" id="act_recovered">0</div>
-                        <div style="font-size:0.72rem;color:var(--text-muted);">TOTAL RECOVERED</div>
+                    <div style="padding:8px 6px 2px;">
+                        <svg id="trkChart" viewBox="0 0 700 150" preserveAspectRatio="none" style="display:block;width:100%;height:150px;">
+                            <defs><linearGradient id="trkFill" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="0" stop-color="#6366f1" stop-opacity=".38"/><stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+                            </linearGradient></defs>
+                            <g id="trkGrid"></g>
+                            <path id="trkArea" fill="url(#trkFill)"></path>
+                            <path id="trkLine" fill="none" stroke="#818cf8" stroke-width="2.5" stroke-linejoin="round"></path>
+                            <circle id="trkDot" r="4.5" fill="#818cf8"></circle>
+                        </svg>
+                        <div id="trkChartX" style="display:flex;justify-content:space-between;padding:2px 12px 10px;font-size:0.64rem;color:var(--text-muted);font-family:var(--font-mono);"></div>
                     </div>
                 </div>
-                <div id="activity_msg" class="modal-msg"></div>
+                <!-- per-client recovered in range -->
+                <div style="font-size:0.75rem;color:var(--text-muted);margin:0 0 0.5rem 0.15rem;">Recovered per client · <span id="trkPerName">last 7 days</span></div>
                 <table class="users-table">
-                    <thead><tr><th style="width:150px;">Time</th><th style="width:120px;">Client</th><th>Event</th></tr></thead>
-                    <tbody id="activity_tbody"></tbody>
+                    <thead><tr><th>Client</th><th style="width:110px;">Status</th><th style="width:120px;">Last seen</th><th style="width:110px;text-align:right;">Recovered</th></tr></thead>
+                    <tbody id="trkClientsBody"></tbody>
                 </table>
             </div>
         </div>
@@ -3336,37 +3479,70 @@ HTML_TEMPLATE = """
             a.href = '/api/clients/' + encodeURIComponent(id) + '/download';
             document.body.appendChild(a); a.click(); a.remove();
         }
+        const TRK_LABELS = {today:'today', yesterday:'yesterday', '3days':'the last 3 days', '7days':'the last 7 days', '1month':'the last month'};
+        let trkRange = '7days';
         function openActivityModal() {
             document.getElementById('activityModal').classList.add('open');
-            loadActivity();
+            loadTracking(trkRange);
         }
         function closeActivityModal() {
             document.getElementById('activityModal').classList.remove('open');
         }
-        function loadActivity() {
-            fetch('/api/activity').then(r => r.json()).then(d => {
-                document.getElementById('act_clients').textContent = d.summary.clients;
-                document.getElementById('act_active').textContent = d.summary.active;
-                document.getElementById('act_recovered').textContent = d.summary.total_recovered;
-                const tb = document.getElementById('activity_tbody');
-                tb.innerHTML = '';
-                if (!d.events || !d.events.length) {
-                    tb.innerHTML = '<tr><td colspan="3" style="color:var(--text-muted);">No activity yet.</td></tr>';
-                    return;
-                }
-                d.events.forEach(e => {
-                    const isDisable = /disabled/i.test(e.message);
-                    const isRecover = /recovered/i.test(e.message);
-                    const color = isDisable ? '#fca5a5' : (isRecover ? '#6ee7b7' : 'var(--text-main)');
-                    const tr = document.createElement('tr');
-                    tr.innerHTML =
-                        '<td style="color:var(--text-muted);font-size:0.8rem;">' + e.time + '</td>' +
-                        '<td><span class="badge badge-user">' + e.client + '</span></td>' +
-                        '<td style="color:' + color + ';">' + e.message + '</td>';
-                    tb.appendChild(tr);
-                });
-            }).catch(() => { document.getElementById('activity_msg').textContent = 'Failed to load activity.'; });
+        function trkAvatar(name) {
+            const cols = ['#6366f1,#4f46e5','#0ea5e9,#0369a1','#10b981,#047857','#f59e0b,#b45309','#a855f7,#7e22ce','#ef4444,#b91c1c'];
+            let h = 0; for (let i=0;i<name.length;i++) h = (h*31 + name.charCodeAt(i)) & 0xffff;
+            const grad = cols[h % cols.length];
+            return '<span class="trk-av" style="background:linear-gradient(145deg,'+grad+')">'+name.slice(0,2).toUpperCase()+'</span>';
         }
+        function trkTimeAgo(ts) {
+            if (!ts) return 'never';
+            const s = Math.floor(Date.now()/1000) - ts;
+            if (s < 60) return s+'s ago'; if (s < 3600) return Math.floor(s/60)+'m ago';
+            if (s < 86400) return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago';
+        }
+        function trkDrawChart(buckets) {
+            const W=700,H=150,pad=14, data=buckets.map(b=>b.count), max=Math.max(...data,1), n=data.length;
+            const step = n>1 ? (W-pad*2)/(n-1) : 0;
+            const pts = data.map((v,i)=>[pad+i*step, H-pad-(v/max)*(H-pad*2)]);
+            const line = pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+            document.getElementById('trkLine').setAttribute('d', line);
+            document.getElementById('trkArea').setAttribute('d', line+' L'+pts[n-1][0].toFixed(1)+','+H+' L'+pts[0][0].toFixed(1)+','+H+' Z');
+            const e = pts[n-1]; document.getElementById('trkDot').setAttribute('cx', e[0]); document.getElementById('trkDot').setAttribute('cy', e[1]);
+            let g=''; [37,75,113].forEach(y=>g+='<line x1="0" y1="'+y+'" x2="700" y2="'+y+'" stroke="rgba(255,255,255,.05)"/>');
+            document.getElementById('trkGrid').innerHTML = g;
+            document.getElementById('trkChartX').innerHTML = buckets.map(b=>'<span>'+b.label+'</span>').join('');
+        }
+        function loadTracking(r) {
+            trkRange = r;
+            [...document.getElementById('trkSeg').children].forEach(b=>b.classList.toggle('on', b.dataset.r===r));
+            const label = TRK_LABELS[r] || r;
+            document.getElementById('trkRangeName').textContent = label;
+            document.getElementById('trkPerName').textContent = label;
+            document.getElementById('trkChartMeta').textContent = label;
+            fetch('/api/tracking?range=' + encodeURIComponent(r)).then(x=>x.json()).then(d => {
+                document.getElementById('trkRecov').textContent = d.recovered;
+                document.getElementById('trkRecovSub').textContent = 'in ' + label;
+                document.getElementById('trkActive').textContent = d.active;
+                document.getElementById('trkClients').textContent = d.total_clients;
+                document.getElementById('trkAll').textContent = d.all_time;
+                document.getElementById('trkChartMeta').textContent = label + ' · ' + d.recovered + ' total';
+                trkDrawChart(d.buckets || []);
+                const tb = document.getElementById('trkClientsBody');
+                if (!d.clients || !d.clients.length) { tb.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted);">No clients yet.</td></tr>'; return; }
+                tb.innerHTML = d.clients.map(c => {
+                    const st = !c.enabled ? '<span class="badge badge-off">Disabled</span>'
+                        : (c.last_seen && (Date.now()/1000 - c.last_seen) < 900 ? '<span class="badge badge-on">Active</span>' : '<span class="badge" style="background:rgba(245,158,11,.15);color:#fcd34d;">Idle</span>');
+                    return '<tr><td>'+trkAvatar(c.client_id)+c.client_id+'</td>'+
+                        '<td>'+st+'</td>'+
+                        '<td style="color:var(--text-muted);font-size:0.8rem;">'+trkTimeAgo(c.last_seen)+'</td>'+
+                        '<td style="text-align:right;font-weight:680;font-variant-numeric:tabular-nums;'+(c.recovered?'color:#c7cbff;':'color:var(--text-muted);')+'">'+c.recovered+'</td></tr>';
+                }).join('');
+            }).catch(()=>{});
+        }
+        document.addEventListener('DOMContentLoaded', function(){
+            var seg = document.getElementById('trkSeg');
+            if (seg) seg.addEventListener('click', function(e){ var b=e.target.closest('button'); if(b) loadTracking(b.dataset.r); });
+        });
         function viewClientLog(id) {
             document.getElementById('client_log_title').textContent = 'Activity — ' + id;
             document.getElementById('client_log_body').textContent = 'Loading…';
