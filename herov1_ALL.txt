@@ -1564,7 +1564,25 @@ def api_tracking():
     now = datetime.now()
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    if rng == 'today':
+    # Custom date / date-range from the calendar picker
+    cf = (request.args.get('from') or '').strip()
+    ct = (request.args.get('to') or '').strip()
+    custom = None
+    if cf and ct:
+        try:
+            s = datetime.strptime(cf, '%Y-%m-%d').replace(hour=0, minute=0, second=0, microsecond=0)
+            e = datetime.strptime(ct, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            if e < s:
+                s, e = datetime.strptime(ct, '%Y-%m-%d'), datetime.strptime(cf, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            custom = (s, e)
+        except Exception:
+            custom = None
+
+    if custom:
+        start, end = custom
+        rng = 'custom'
+        unit = 'hour' if start.date() == end.date() else 'day'
+    elif rng == 'today':
         start, end, unit = midnight, now, 'hour'
     elif rng == 'yesterday':
         end = midnight; start = midnight - timedelta(days=1); unit = 'hour'
@@ -1595,12 +1613,21 @@ def api_tracking():
             cur = nxt
     else:
         ndays = (end.date() - start.date()).days + 1
-        for i in range(ndays):
-            day = start + timedelta(days=i)
-            nxt = day + timedelta(days=1)
-            cnt = sum(d for (dt, d, _) in events if day <= dt < nxt)
-            label = day.strftime('%a') if rng in ('3days', '7days') else f"{day.month}/{day.day}"
-            buckets.append({"label": label, "count": cnt})
+        if ndays > 45:
+            # long ranges -> weekly buckets so the chart stays readable
+            cur = start.replace(hour=0, minute=0, second=0, microsecond=0)
+            while cur <= end:
+                nxt = cur + timedelta(days=7)
+                cnt = sum(d for (dt, d, _) in events if cur <= dt < nxt)
+                buckets.append({"label": f"{cur.month}/{cur.day}", "count": cnt})
+                cur = nxt
+        else:
+            for i in range(ndays):
+                day = (start + timedelta(days=i)).replace(hour=0, minute=0, second=0, microsecond=0)
+                nxt = day + timedelta(days=1)
+                cnt = sum(d for (dt, d, _) in events if day <= dt < nxt)
+                label = day.strftime('%a') if rng in ('3days', '7days') else f"{day.month}/{day.day}"
+                buckets.append({"label": label, "count": cnt})
 
     total = sum(b["count"] for b in buckets)
 
@@ -2956,6 +2983,8 @@ HTML_TEMPLATE = """
         .trk-kpi .s { font-size:0.7rem; color:var(--text-muted); margin-top:5px; opacity:.8; }
         .trk-kpi.good .v { color:#5eead4; } .trk-kpi.accent .v { color:#c7cbff; }
         .trk-av { width:30px; height:30px; border-radius:9px; display:inline-grid; place-items:center; font-weight:650; font-size:0.72rem; color:#fff; font-family:var(--font-mono); vertical-align:middle; margin-right:9px; }
+        .trk-date { background:rgba(0,0,0,0.25); border:1px solid var(--border-color); border-radius:8px; color:var(--text-main); font-family:var(--font-main); font-size:0.8rem; padding:6px 10px; outline:none; color-scheme:dark; }
+        .trk-date:focus { border-color:var(--primary-glow); }
         @media (max-width:640px){ .trk-kpis { grid-template-columns:repeat(2,1fr); } }
     </style>
 </head>
@@ -3106,7 +3135,7 @@ HTML_TEMPLATE = """
             </div>
             <div class="modal-body">
                 <!-- range switcher -->
-                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:1rem;">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:0.75rem;">
                     <div class="trk-seg" id="trkSeg">
                         <button data-r="today">Today</button>
                         <button data-r="yesterday">Yesterday</button>
@@ -3115,6 +3144,15 @@ HTML_TEMPLATE = """
                         <button data-r="1month">1 month</button>
                     </div>
                     <div style="font-size:0.78rem;color:var(--text-muted);">Showing <b id="trkRangeName" style="color:var(--text-main);">last 7 days</b></div>
+                </div>
+                <!-- custom calendar range -->
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:1rem;">
+                    <span style="font-size:0.68rem;color:var(--text-muted);letter-spacing:.06em;text-transform:uppercase;">Pick dates</span>
+                    <input type="date" id="trkFrom" class="trk-date">
+                    <span style="color:var(--text-muted);">→</span>
+                    <input type="date" id="trkTo" class="trk-date">
+                    <button onclick="applyTrkCustom()" class="btn-primary" style="padding:6px 13px;font-size:0.78rem;">Apply</button>
+                    <span id="trkOneDay" style="font-size:0.7rem;color:var(--text-muted);">tip: same date twice = single day</span>
                 </div>
                 <!-- KPIs (exact) -->
                 <div class="trk-kpis">
@@ -3754,14 +3792,27 @@ HTML_TEMPLATE = """
             document.getElementById('trkGrid').innerHTML = g;
             document.getElementById('trkChartX').innerHTML = buckets.map(b=>'<span>'+b.label+'</span>').join('');
         }
-        function loadTracking(r) {
+        function applyTrkCustom() {
+            const f = document.getElementById('trkFrom').value, t = document.getElementById('trkTo').value;
+            if (!f || !t) { document.getElementById('trkOneDay').textContent = 'pick both dates'; return; }
+            loadTracking('custom', f, t);
+        }
+        function loadTracking(r, cf, ct) {
             trkRange = r;
-            [...document.getElementById('trkSeg').children].forEach(b=>b.classList.toggle('on', b.dataset.r===r));
-            const label = TRK_LABELS[r] || r;
+            const custom = !!(cf && ct);
+            [...document.getElementById('trkSeg').children].forEach(b=>b.classList.toggle('on', !custom && b.dataset.r===r));
+            let url, label;
+            if (custom) {
+                url = '/api/tracking?from=' + encodeURIComponent(cf) + '&to=' + encodeURIComponent(ct);
+                label = (cf === ct) ? cf : (cf + ' → ' + ct);
+            } else {
+                url = '/api/tracking?range=' + encodeURIComponent(r);
+                label = TRK_LABELS[r] || r;
+            }
             document.getElementById('trkRangeName').textContent = label;
             document.getElementById('trkPerName').textContent = label;
             document.getElementById('trkChartMeta').textContent = label;
-            fetch('/api/tracking?range=' + encodeURIComponent(r)).then(x=>x.json()).then(d => {
+            fetch(url).then(x=>x.json()).then(d => {
                 document.getElementById('trkRecov').textContent = d.recovered;
                 document.getElementById('trkRecovSub').textContent = 'in ' + label;
                 document.getElementById('trkActive').textContent = d.active;
