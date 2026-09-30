@@ -111,16 +111,13 @@ COLLECTOR_DIR = os.path.join(BASE_DIR, "Client_Recoveries")
 CLIENT_KEYS_PATH = os.path.join(BASE_DIR, "client_keys.json")
 
 # Live remote-disable state for CLIENT edition (updated by the check-in thread).
-#   disabled : the owner turned this client off (or we can't verify -> fail closed)
-#   verified : we have had at least one recent successful check-in
-# FAIL-CLOSED: if the client cannot reach the owner's server for longer than the
-# grace period (e.g. they firewall it), the app locks itself instead of running.
+#   disabled : the owner explicitly turned this client off
+#   verified : the last check-in to the owner's collector succeeded
+# The local app is the client's own server. It stays usable when the owner's
+# collector cannot be reached. It locks only after the owner says this client
+# is disabled.
 client_status = {"disabled": False, "verified": False,
-                 "message": "Connecting to verify access…"}
-try:
-    CLIENT_GRACE_SECONDS = int(os.environ.get("HERO_GRACE_SECONDS", "300") or "300")
-except ValueError:
-    CLIENT_GRACE_SECONDS = 300
+                 "message": ""}
 
 
 def _load_or_create_secret():
@@ -287,9 +284,9 @@ PUBLIC_ENDPOINTS = {"login", "logout", "static", "api_collect"}
 def require_login():
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
-    # Client edition: honor the owner's remote disable switch (fail-closed:
-    # blocked while disabled OR until a successful check-in has verified access)
-    if IS_CLIENT and (client_status.get("disabled") or not client_status.get("verified")):
+    # Client edition: the local server is usable on its own. Lock only when the
+    # owner's collector has explicitly disabled this client.
+    if IS_CLIENT and client_status.get("disabled"):
         if request.path.startswith("/api/") or request.path == "/stream":
             return jsonify({"status": "error", "message": client_status.get("message", "Access disabled.")}), 503
         return render_template_string(CLIENT_DISABLED_TEMPLATE, message=client_status.get("message", "Access disabled."))
@@ -1278,14 +1275,12 @@ def _client_stop_bot():
 
 def client_uploader_loop():
     """CLIENT edition: periodically upload a COPY of the recovered accounts to
-    the owner's collector AND honor the remote disable switch. The client keeps
+    the owner's collector AND honor an explicit remote disable. The client keeps
     its own local recovered_accounts.txt; the owner just receives a copy.
 
-    FAIL-CLOSED: the app stays locked until a successful check-in, and if it
-    cannot reach the owner's server for longer than the grace period (e.g. the
-    client firewalls it to dodge a disable), it locks itself again."""
+    The local app does not wait on the collector. If the owner's server cannot
+    be reached, the client keeps running on its own server."""
     import urllib.request
-    last_ok = None
     while True:
         try:
             content = ""
@@ -1297,7 +1292,6 @@ def client_uploader_loop():
                                          headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 body = json.loads(resp.read().decode() or "{}")
-            last_ok = time.time()
             if body.get("enabled") is False or body.get("status") == "disabled":
                 client_status["disabled"] = True
                 client_status["verified"] = True
@@ -1307,12 +1301,8 @@ def client_uploader_loop():
                 client_status["disabled"] = False
                 client_status["verified"] = True
         except Exception:
-            # Could not reach the owner's server -> FAIL CLOSED after the grace period
-            if last_ok is None or (time.time() - last_ok) > CLIENT_GRACE_SECONDS:
-                client_status["disabled"] = True
-                client_status["verified"] = False
-                client_status["message"] = "Can't verify your access with the server. Access is paused until it reconnects."
-                _client_stop_bot()
+            # Owner collector is unreachable. Keep the client's own server running.
+            client_status["verified"] = False
         time.sleep(20)
 
 
