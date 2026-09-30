@@ -96,6 +96,19 @@ def update_daily_stats(recovered: int = 0, spent: float = 0.0, duration: int = 0
     except Exception as e:
         print(f"Could not record daily statistic: {e}")
 
+def log_phone_attempt(phone_number: str, result_status: str, details: str = "") -> None:
+    """Append one number outcome. Used by Hero SMS API mode."""
+    import datetime
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    provider = str(getattr(CONFIG, "sms_provider", "hero-sms") or "hero-sms")
+    log_line = f"[{now_str}] Provider: {provider.upper()} | Number: {phone_number} | Result: {result_status.upper()} | Details: {details}\n"
+    try:
+        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phone_attempts_log.txt")
+        with open(log_file_path, "a", encoding="utf-8") as f:
+            f.write(log_line)
+    except Exception as e:
+        print(f"⚠️ Failed to write to phone attempts log: {e}")
+
 def is_chrome_running() -> bool:
     try:
         import subprocess
@@ -239,6 +252,21 @@ def generate_next_profile_name(user_data_dir: str = None, exclude: set = None, f
             print(f"ℹ️ Generated fresh unused profile: '{profile_folder_name}'")
             return profile_folder_name
         next_num += 1
+
+def delete_profile_folder(profile_name: str, subdir: str = "chrome_profiles_fb") -> None:
+    if not profile_name or "profile" not in profile_name.lower():
+        return
+    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), subdir, profile_name)
+    if not os.path.exists(profile_path):
+        return
+    print(f"🧹 Cleaning up unused profile folder: {profile_name}...")
+    for _attempt in range(3):
+        try:
+            shutil.rmtree(profile_path)
+            print(f"✅ Deleted unused profile folder '{profile_name}'.")
+            return
+        except Exception:
+            time.sleep(1)
 
 def launch_and_connect_chrome(p, port: int, profile_name: str, user_data_subdir: str = "chrome_profiles", is_guest: bool = False, is_mobile: bool = False):
     import subprocess
@@ -772,6 +800,10 @@ class AutomationConfig:
     min_price: float = 0.01
     max_price: float = 0.15
 
+    # "hero-sms" keeps the browser login flow. "hero-api" buys through the HTTP API.
+    sms_provider: str = "hero-sms"
+    hero_api_key: str = ""
+
 
 def load_config() -> AutomationConfig:
     import json
@@ -790,7 +822,9 @@ def load_config() -> AutomationConfig:
         "hero_password": "",
         "vpn_connection_name": "",
         "min_price": 0.01,
-        "max_price": 0.15
+        "max_price": 0.15,
+        "sms_provider": "hero-sms",
+        "hero_api_key": ""
     }
     
     if os.path.exists(config_path):
@@ -816,7 +850,9 @@ def load_config() -> AutomationConfig:
                 hero_password=merged.get("hero_password", ""),
                 vpn_connection_name=merged.get("vpn_connection_name", ""),
                 min_price=float(merged.get("min_price", 0.01)),
-                max_price=float(merged.get("max_price", 0.15))
+                max_price=float(merged.get("max_price", 0.15)),
+                sms_provider=merged.get("sms_provider", "hero-sms") or "hero-sms",
+                hero_api_key=merged.get("hero_api_key", "") or ""
             )
         except Exception as e:
             print(f"⚠️ Could not load config.json, using defaults: {e}")
@@ -825,6 +861,92 @@ def load_config() -> AutomationConfig:
 
 
 CONFIG = load_config()
+
+
+class HeroSMSAPI:
+    """Direct API client for Hero SMS (SMS-Activate protocol) to bypass browser Cloudflare."""
+    COUNTRY_NAME_TO_ID = {
+        "brazil": "73", "usa": "12", "united states": "12", "indonesia": "6",
+        "philippines": "4", "vietnam": "10", "india": "22", "colombia": "33",
+        "peru": "60", "mexico": "54", "thailand": "52", "malaysia": "7",
+        "egypt": "21", "nigeria": "19", "kenya": "76", "pakistan": "66"
+    }
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key.strip()
+        self.base_url = "https://hero-sms.com/stubs/handler_api.php"
+
+    def _request(self, params: dict) -> str:
+        import urllib.request
+        import urllib.parse
+        params["api_key"] = self.api_key
+        url = f"{self.base_url}?{urllib.parse.urlencode(params)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.read().decode("utf-8").strip()
+        except urllib.error.HTTPError as he:
+            err_body = ""
+            try:
+                err_body = he.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            reason = getattr(he, "reason", "") or "request failed"
+            raise RuntimeError(f"Hero SMS API HTTP {he.code}: {err_body or reason}")
+        except Exception as e:
+            raise RuntimeError(f"Hero SMS API connection error: {e}")
+
+    def get_balance(self) -> str:
+        resp = self._request({"action": "getBalance"})
+        if resp.startswith("ACCESS_BALANCE:"):
+            return resp.split(":", 1)[1].strip()
+        raise RuntimeError(f"Hero SMS API getBalance error: {resp}")
+
+    def get_number(self, service: str = "fb", country: str = "73") -> tuple[str, str, float]:
+        c_id = self.COUNTRY_NAME_TO_ID.get(country.lower().strip(), country.strip())
+        srv = "fb" if service.lower() in ["fb", "facebook"] else service.strip()
+        params = {"action": "getNumber", "service": srv, "country": c_id}
+        if getattr(CONFIG, "max_price", 0) > 0:
+            params["maxPrice"] = str(CONFIG.max_price)
+        resp = self._request(params)
+        if resp.startswith("ACCESS_NUMBER:"):
+            parts = resp.split(":")
+            activation_id = parts[1].strip()
+            phone_number = parts[2].strip()
+            price = getattr(CONFIG, "max_price", 0.05)
+            return activation_id, phone_number, price
+        raise RuntimeError(f"Hero SMS getNumber error: {resp}")
+
+    def get_status(self, activation_id: str) -> str | None:
+        resp = self._request({"action": "getStatus", "id": str(activation_id)})
+        if resp.startswith("STATUS_OK:"):
+            return resp.split(":", 1)[1].strip()
+        if resp == "STATUS_WAIT_CODE":
+            return None
+        if resp in ["STATUS_CANCEL", "ACCESS_CANCEL"]:
+            raise RuntimeError("Activation was cancelled by provider.")
+        return None
+
+    def set_status(self, activation_id: str, status: int) -> str:
+        # status 8 = cancel, status 6 = complete, status 1 = ready
+        resp = self._request({"action": "setStatus", "status": str(status), "id": str(activation_id)})
+        return resp
+
+
+def hero_api_enabled() -> bool:
+    """Use the HTTP API when the provider is hero-api, or when an API key is saved.
+
+    Browser login stays on when the provider is the browser mode and the key is empty.
+    """
+    provider = str(getattr(CONFIG, "sms_provider", "hero-sms") or "hero-sms").strip().lower()
+    key = str(getattr(CONFIG, "hero_api_key", "") or "").strip()
+    if provider == "hero-api":
+        return True
+    return bool(key)
 
 
 PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\s().-]{7,}\d)(?!\d)")
@@ -2623,10 +2745,439 @@ def rotate_vpn_if_configured() -> None:
         print(f"⚠️ [VPN] Error rotating VPN: {e}")
 
 
+def _free_local_port(start: int = 9223) -> int:
+    import socket
+    port = start
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                port += 1
+
+
+def verify_search_integrity(context) -> bool:
+    control_num = getattr(CONFIG, "control_phone_number", "")
+    if not control_num:
+        return True
+    print(f"\n🔍 [Integrity Check] Testing Facebook search with known control number: {control_num}...")
+    try:
+        result, target = fill_target_page(context, control_num)
+        if target:
+            try:
+                target.close()
+            except Exception:
+                pass
+        if result == "not_found":
+            print("🚨 [Integrity Check] FAILED! Facebook returned 'No Account Found' for a known valid control number. Shadow-block detected!")
+            return False
+        print("✅ [Integrity Check] PASSED! Facebook recovery search is working properly.")
+        return True
+    except Exception as e:
+        print(f"⚠️ [Integrity Check] Search test error: {e}. Assuming working.")
+        return True
+
+
+def _cancel_hero_activation(api_client: HeroSMSAPI, activation_id: str) -> None:
+    try:
+        api_client.set_status(activation_id, 8)
+    except Exception:
+        pass
+
+
+def run_hero_api_mode(p) -> None:
+    """Buy and poll numbers through the Hero SMS HTTP API, then run herov2's Facebook recovery."""
+    provider_name = "Hero SMS API"
+    api_key = str(getattr(CONFIG, "hero_api_key", "") or "").strip()
+    if not api_key:
+        print("❌ Hero SMS API mode is selected, but hero_api_key is empty.")
+        print("Add a key in Settings, or switch SMS Procurement Method back to Browser.")
+        return
+
+    api_client = HeroSMSAPI(api_key)
+    try:
+        balance = api_client.get_balance()
+        print(f"💰 Current {provider_name} Balance: {balance}")
+    except Exception as e:
+        print(f"❌ Failed to connect to {provider_name}: {e}")
+        return
+
+    session_start_time = time.time()
+    accounts_recovered = 0
+    total_numbers_tried = 0
+    total_spent = 0.0
+    consecutive_not_found = 0
+
+    fb_browser = None
+    fb_port = None
+    fb_page = None
+    fb_profile_name = None
+    fb_context = None
+    fb_active_name = "Unknown"
+
+    max_attempts = 20
+    attempt = 0
+    success = False
+    is_looping = getattr(CONFIG, "multiple_accounts", False)
+    service = str(getattr(CONFIG, "service_text", "Facebook") or "Facebook")
+    country = str(getattr(CONFIG, "country_text", "Brazil") or "Brazil")
+
+    stale_flag = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stop.flag")
+    if os.path.exists(stale_flag):
+        try:
+            os.remove(stale_flag)
+        except Exception:
+            pass
+
+    while (attempt < max_attempts or is_looping) and not success:
+        try:
+            check_stop_flag()
+        except KeyboardInterrupt:
+            print("\n🛑 Stop signal detected. Exiting API Mode...")
+            break
+
+        attempt += 1
+        rotate_vpn_if_configured()
+        print(f"\n{'='*60}")
+        print(f"Attempt {attempt}/{max_attempts} ({provider_name} Mode)")
+        print(f"{'='*60}")
+
+        if not is_placeholder_url(CONFIG.target_url):
+            try:
+                if not fb_browser or not fb_browser.is_connected():
+                    fb_profile_name = generate_next_profile_name(force_new=True)
+                    fb_port = _free_local_port()
+                    print(f"\n🔄 Spawning separate fresh Chrome profile '{fb_profile_name}' on port {fb_port} for Facebook recovery...")
+                    fb_browser, fb_context, _fb_is_standalone = launch_and_connect_chrome(
+                        p, fb_port, fb_profile_name, user_data_subdir="chrome_profiles_fb", is_guest=False, is_mobile=False
+                    )
+                else:
+                    print(f"\n🔄 Reusing running Chrome profile '{fb_profile_name}' for this attempt...")
+
+                fb_active_name = fb_profile_name
+                try:
+                    local_state_path = os.path.join(get_official_chrome_user_data_dir(), "Local State")
+                    if os.path.exists(local_state_path):
+                        with open(local_state_path, "r", encoding="utf-8") as f:
+                            state_data = json.load(f)
+                        h_name = state_data.get("profile", {}).get("info_cache", {}).get(fb_profile_name, {}).get("name")
+                        if h_name:
+                            fb_active_name = h_name
+                except Exception:
+                    pass
+
+                print("🔍 Verifying profile state before purchasing number...")
+                temp_page = fb_context.new_page()
+                temp_page.goto(CONFIG.target_url, wait_until="domcontentloaded")
+                is_logged_in = False
+                try:
+                    fb_cookies = fb_context.cookies("https://www.facebook.com")
+                    if any(c["name"] == "c_user" for c in fb_cookies):
+                        is_logged_in = True
+                except Exception:
+                    pass
+                if is_logged_in:
+                    print(f"⚠️ Profile '{fb_profile_name}' already contains an active Facebook session!")
+                    try:
+                        temp_page.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError("Target profile is already logged in to Facebook. Skipping to preserve session.")
+                try:
+                    temp_page.close()
+                except Exception:
+                    pass
+            except Exception as setup_err:
+                print(f"\n❌ Error during Facebook profile verification: {setup_err}")
+                if fb_browser:
+                    try:
+                        fb_browser.close()
+                    except Exception:
+                        pass
+                if fb_port:
+                    try:
+                        close_chrome_on_port(fb_port)
+                    except Exception:
+                        pass
+                fb_browser = None
+                fb_page = None
+                fb_context = None
+                fb_port = None
+                fb_profile_name = None
+                print("🔄 Retrying with a new profile index in next attempt...")
+                time.sleep(2)
+                continue
+
+        print(f"\n📞 Requesting a new virtual number from {provider_name} ({service} / {country})...")
+        current_number_price = 0.0
+        activation_id = ""
+        try:
+            activation_id, phone_number, price_usd = api_client.get_number(service, country)
+            current_number_price = float(price_usd)
+            print(f"✅ Purchased number: {phone_number} (Activation ID: {activation_id}, Price: ${current_number_price:.3f} USD)")
+        except Exception as purchase_err:
+            print(f"❌ Failed to purchase number via API: {purchase_err}")
+            print("⏳ Waiting 10 seconds before retrying...")
+            time.sleep(10)
+            continue
+
+        phone_number = phone_number.lstrip("+")
+        try:
+            pyperclip.copy(phone_number)
+            print("📋 Copied phone number to clipboard.")
+        except Exception as clip_err:
+            print(f"⚠️ Could not copy phone number to clipboard: {clip_err}")
+
+        if not is_placeholder_url(CONFIG.target_url):
+            total_numbers_tried += 1
+            try:
+                max_profile_retries = 3
+                flagged_profiles = set()
+                result = "failed"
+                for profile_retry in range(max_profile_retries):
+                    if not fb_browser or not fb_browser.is_connected():
+                        fb_profile_name = generate_next_profile_name(exclude=flagged_profiles, force_new=True)
+                        fb_port = _free_local_port()
+                        use_mobile_agent = profile_retry > 0
+                        print(f"\n🔄 Spawning fresh Chrome profile '{fb_profile_name}' on port {fb_port} (Mobile agent: {use_mobile_agent})...")
+                        fb_browser, fb_context, _fb_is_standalone = launch_and_connect_chrome(
+                            p, fb_port, fb_profile_name,
+                            user_data_subdir="chrome_profiles_fb",
+                            is_guest=False,
+                            is_mobile=use_mobile_agent,
+                        )
+                        fb_active_name = fb_profile_name
+
+                    print(f"\n📝 Filling target page with phone number {phone_number} (Attempt {profile_retry + 1}/{max_profile_retries})...")
+                    result, fb_page = fill_target_page(fb_context, phone_number)
+
+                    if result == "rate_limited":
+                        print(f"\n🛑 Facebook Rate-Limit Blocked profile '{fb_profile_name}'!")
+                        print(f"🧹 Deleting flagged profile directory '{fb_profile_name}' and spawning a NEW profile...")
+                        flagged_profiles.add(fb_profile_name)
+                        try:
+                            fb_page.close()
+                        except Exception:
+                            pass
+                        try:
+                            fb_browser.close()
+                        except Exception:
+                            pass
+                        if fb_port:
+                            close_chrome_on_port(fb_port)
+                        if fb_profile_name and fb_profile_name != "Guest":
+                            delete_profile_folder(fb_profile_name, subdir="chrome_profiles_fb")
+                        fb_browser = None
+                        fb_page = None
+                        fb_context = None
+                        fb_port = None
+                        fb_profile_name = None
+                        print("⏳ Waiting 10 seconds and rotating IP if configured...")
+                        time.sleep(10)
+                        rotate_vpn_if_configured()
+                        continue
+                    break
+
+                if result == "success" and fb_page:
+                    print("\n✅ SUCCESS! Account found and recovery in progress!")
+                    print(f"\n🔄 Marking phone number as ready in {provider_name} and waiting for SMS code...")
+                    try:
+                        api_client.set_status(activation_id, 1)
+                    except Exception as ready_err:
+                        print(f"⚠️ Warning: could not set status to ready: {ready_err}")
+
+                    sms_code = None
+                    timeout_sec = 180
+                    poll_start = time.time()
+                    print(f"⏳ Waiting up to {timeout_sec} seconds for SMS code from {provider_name}...")
+                    while time.time() - poll_start < timeout_sec:
+                        try:
+                            check_stop_flag()
+                        except KeyboardInterrupt:
+                            print("\n🛑 Stop signal detected while waiting for SMS. Cancelling number...")
+                            _cancel_hero_activation(api_client, activation_id)
+                            raise
+                        try:
+                            code = api_client.get_status(activation_id)
+                            if code:
+                                sms_code = code
+                                print(f"\n🔑 SMS Code Received: {sms_code}")
+                                break
+                        except Exception:
+                            pass
+                        sys.stdout.write(".")
+                        sys.stdout.flush()
+                        time.sleep(3)
+
+                    if sms_code:
+                        total_spent += current_number_price
+                        update_daily_stats(spent=current_number_price)
+                        print("\n🔄 Entering code on Facebook...")
+                        submit_success = submit_facebook_code(fb_page, sms_code)
+                        if submit_success:
+                            print("\n🎉 CODE SUBMITTED SUCCESSFULLY! 🎉")
+                            pwd_status, password_used = handle_post_verification(fb_context, fb_page)
+                            if pwd_status in ["success", "2fa"]:
+                                try:
+                                    api_client.set_status(activation_id, 6)
+                                except Exception as complete_err:
+                                    print(f"⚠️ Warning: could not complete activation status: {complete_err}")
+                                two_fa_str = "2FA" if pwd_status == "2fa" else ""
+                                extract_session_data(fb_context, fb_page, phone_number, password_used, fb_active_name, two_fa=two_fa_str)
+                                accounts_recovered += 1
+                                update_daily_stats(recovered=1)
+                                log_phone_attempt(phone_number, "success", f"Account recovered successfully (profile: {fb_active_name}, two_fa: {two_fa_str})")
+                                consecutive_not_found = 0
+                                print("\n" + "=" * 60)
+                                if pwd_status == "2fa":
+                                    print(f"✅ SUCCESS (2FA)! Recovered Account #{accounts_recovered} in '{fb_active_name}'")
+                                else:
+                                    print(f"✅ SUCCESS! Recovered Account #{accounts_recovered} in '{fb_active_name}'")
+                                print("=" * 60)
+                                try:
+                                    fb_page.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    fb_browser.close()
+                                except Exception:
+                                    pass
+                                if fb_port:
+                                    close_chrome_on_port(fb_port)
+                                time.sleep(1.5)
+                                if fb_profile_name and fb_profile_name != "Guest":
+                                    sync_profile_to_official(fb_profile_name)
+                                fb_browser = None
+                                fb_page = None
+                                fb_context = None
+                                fb_port = None
+                                fb_profile_name = None
+                                if getattr(CONFIG, "multiple_accounts", False):
+                                    attempt = 0
+                                    continue
+                                success = True
+                                break
+                            print(f"\n❌ Post-verification failed (Status: {pwd_status}). Cancelling number...")
+                            update_daily_stats(failed_logins=1)
+                            log_phone_attempt(phone_number, "failed_login", f"SMS code accepted but post-verification failed (status: {pwd_status})")
+                            _cancel_hero_activation(api_client, activation_id)
+                            time.sleep(2)
+                        else:
+                            print("\n❌ Failed to submit code on Facebook. Cancelling number...")
+                            update_daily_stats(failed_logins=1)
+                            log_phone_attempt(phone_number, "invalid_code", "Verification code entered on Facebook failed/invalid")
+                            _cancel_hero_activation(api_client, activation_id)
+                            time.sleep(2)
+                    else:
+                        print("\n❌ SMS verification timed out. Cancelling number...")
+                        log_phone_attempt(phone_number, "sms_timeout", f"No SMS received from {provider_name} within 180s")
+                        _cancel_hero_activation(api_client, activation_id)
+                        time.sleep(2)
+                elif result == "rate_limited":
+                    print(f"\n🛑 Number {phone_number} reached max profile retries on rate limits. Cancelling number...")
+                    log_phone_attempt(phone_number, "rate_limited", "Facebook rate-limited/blocked number on all profile retries")
+                    _cancel_hero_activation(api_client, activation_id)
+                    time.sleep(2)
+                elif result == "not_found":
+                    print("\n❌ No account found with this number. Cancelling number...")
+                    log_phone_attempt(phone_number, "no_account_found", "Facebook returned no account matching this phone number")
+                    _cancel_hero_activation(api_client, activation_id)
+                    consecutive_not_found += 1
+                    if consecutive_not_found >= 5:
+                        print(f"\n🚨 POTENTIAL FACEBOOK SHADOW-BLOCK DETECTED! ({consecutive_not_found} consecutive 'No Account Found' results).")
+                        is_working = verify_search_integrity(fb_context)
+                        if not is_working:
+                            print("🔄 Shadow-block confirmed! Forcing VPN Rotation to clear potential block...")
+                            rotate_vpn_if_configured()
+                        else:
+                            print("ℹ️ Search integrity verified. The numbers tried really do not have Facebook accounts.")
+                        consecutive_not_found = 0
+                    time.sleep(2)
+                else:
+                    print(f"\n❌ Failed to load target recovery form: {result}. Cancelling number...")
+                    log_phone_attempt(phone_number, "load_error", f"Failed to load Facebook identify page: {result}")
+                    _cancel_hero_activation(api_client, activation_id)
+                    time.sleep(2)
+            except KeyboardInterrupt:
+                print("\n🛑 Stop signal detected. Exiting API Mode...")
+                if activation_id:
+                    _cancel_hero_activation(api_client, activation_id)
+                break
+            except Exception as setup_err:
+                print(f"\n❌ Error during Facebook recovery setup: {setup_err}")
+                if activation_id:
+                    _cancel_hero_activation(api_client, activation_id)
+                if fb_page:
+                    try:
+                        fb_page.close()
+                    except Exception:
+                        pass
+                if fb_browser:
+                    try:
+                        fb_browser.close()
+                    except Exception:
+                        pass
+                if fb_port:
+                    try:
+                        close_chrome_on_port(fb_port)
+                    except Exception:
+                        pass
+                if fb_profile_name and fb_profile_name != "Guest":
+                    delete_profile_folder(fb_profile_name, subdir="chrome_profiles_fb")
+                fb_browser = None
+                fb_page = None
+                fb_context = None
+                fb_port = None
+                fb_profile_name = None
+                time.sleep(2)
+
+            if fb_browser:
+                print("🧹 Closing Chrome and resetting profile context to prepare a fresh session for the next number...")
+                try:
+                    fb_page.close()
+                except Exception:
+                    pass
+                try:
+                    fb_browser.close()
+                except Exception:
+                    pass
+                if fb_port:
+                    try:
+                        close_chrome_on_port(fb_port)
+                    except Exception:
+                        pass
+                if not success and fb_profile_name and fb_profile_name != "Guest":
+                    delete_profile_folder(fb_profile_name, subdir="chrome_profiles_fb")
+                fb_browser = None
+                fb_page = None
+                fb_context = None
+                fb_port = None
+                fb_profile_name = None
+                time.sleep(2)
+
+    print("\n" + "=" * 60)
+    print(f"SESSION SUMMARY ({provider_name} Mode)")
+    print(f"Recovered accounts: {accounts_recovered}")
+    print(f"Total numbers tried: {total_numbers_tried}")
+    print(f"Total amount spent: ${total_spent:.3f}")
+    print(f"Total time elapsed: {int(time.time() - session_start_time)} seconds")
+    print("=" * 60)
+
+
 def main() -> None:
     session_start_time = time.time()
+    accounts_recovered = 0
+    total_numbers_tried = 0
+    total_spent = 0.0
+    session_stats = {"captcha_triggers": 0}
     try:
         with sync_playwright() as p:
+            if hero_api_enabled():
+                print("\n⚡ Running in Hero SMS API Mode (Bypassing browser & Cloudflare)...")
+                run_hero_api_mode(p)
+                return
+
             profile_name = getattr(CONFIG, 'chrome_profile_name', "Default")
             active_port = 9222
             browser, context, is_standalone = launch_and_connect_chrome(p, active_port, profile_name, user_data_subdir="chrome_profiles_hero")

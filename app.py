@@ -45,7 +45,9 @@ DEFAULT_CONFIG = {
     "auto_login": False,
     "hero_username": "",
     "hero_password": "",
-    "vpn_connection_name": ""
+    "vpn_connection_name": "",
+    "sms_provider": "hero-sms",
+    "hero_api_key": ""
 }
 
 def load_config_data():
@@ -2576,6 +2578,33 @@ HTML_TEMPLATE = """
         .modal-msg { font-size: 0.82rem; min-height: 1.1rem; margin-bottom: 0.6rem; }
         .modal-msg.ok { color: #6ee7b7; }
         .modal-msg.err { color: #fca5a5; }
+        .segmented-switch {
+            display: flex;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 4px;
+            margin-top: 0.35rem;
+            position: relative;
+        }
+        .switch-option {
+            flex: 1;
+            text-align: center;
+            padding: 10px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-radius: 8px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 2;
+        }
+        .switch-option:hover { color: var(--text-main); }
+        .switch-option.active {
+            color: #ffffff;
+            background: linear-gradient(135deg, var(--primary-glow), #4f46e5);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
     </style>
 </head>
 <body>
@@ -2807,6 +2836,28 @@ HTML_TEMPLATE = """
             <div class="input-group">
                 <label>Chrome Profile Name</label>
                 <input type="text" id="chrome_profile_name" placeholder="Profile 1">
+            </div>
+
+            <div class="input-group">
+                <label>SMS Procurement Method</label>
+                <div class="segmented-switch">
+                    <div class="switch-option" id="opt-hero-api" onclick="selectProvider('hero-api')">HeroSMS (API)</div>
+                    <div class="switch-option active" id="opt-hero" onclick="selectProvider('hero-sms')">HeroSMS (Browser)</div>
+                </div>
+                <input type="hidden" id="sms_provider" value="hero-sms">
+            </div>
+
+            <div id="hero-api-only-fields" style="display: none; flex-direction: column; gap: 0.75rem;">
+                <div style="border: 1px dashed var(--border-color); padding: 1rem; border-radius: 8px; margin: 0.25rem 0; background: rgba(255,255,255,0.01);">
+                    <div class="input-group">
+                        <label style="font-size: 0.75rem;">Hero SMS API Key</label>
+                        <div class="pw-wrap">
+                            <input type="password" id="hero_api_key" placeholder="Enter Hero SMS API Key" autocomplete="off">
+                            <button type="button" class="pw-toggle" onclick="togglePw('hero_api_key', this)" title="Show/hide API key" aria-label="Show or hide API key">Show</button>
+                        </div>
+                    </div>
+                    <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.35rem;">Buys numbers over the Hero SMS HTTP API and skips the Hero SMS browser login. Service and country still come from Target Service and Target Country. A saved key turns API mode on even if Browser is selected — clear the key to stay on browser login.</p>
+                </div>
             </div>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
@@ -3456,6 +3507,23 @@ HTML_TEMPLATE = """
             }
         }
 
+        function selectProvider(provider) {
+            const chosen = provider === 'hero-api' ? 'hero-api' : 'hero-sms';
+            document.getElementById('sms_provider').value = chosen;
+            const optHeroApi = document.getElementById('opt-hero-api');
+            const optHero = document.getElementById('opt-hero');
+            const heroApiFields = document.getElementById('hero-api-only-fields');
+            if (optHeroApi) optHeroApi.classList.remove('active');
+            if (optHero) optHero.classList.remove('active');
+            if (chosen === 'hero-api') {
+                if (optHeroApi) optHeroApi.classList.add('active');
+                if (heroApiFields) heroApiFields.style.display = 'flex';
+            } else {
+                if (optHero) optHero.classList.add('active');
+                if (heroApiFields) heroApiFields.style.display = 'none';
+            }
+        }
+
         function loadConfig() {
             fetch('/api/config')
                 .then(res => res.json())
@@ -3477,6 +3545,11 @@ HTML_TEMPLATE = """
                     document.getElementById('hero_username').value = data.hero_username || '';
                     document.getElementById('hero_password').value = data.hero_password || '';
                     toggleAutoLoginFields();
+
+                    const apiKeyEl = document.getElementById('hero_api_key');
+                    if (apiKeyEl) apiKeyEl.value = data.hero_api_key || '';
+                    const provider = data.sms_provider || (data.hero_api_key ? 'hero-api' : 'hero-sms');
+                    selectProvider(provider);
                 });
         }
 
@@ -3497,7 +3570,9 @@ HTML_TEMPLATE = """
                 
                 auto_login: document.getElementById('auto_login').checked,
                 hero_username: document.getElementById('hero_username').value,
-                hero_password: document.getElementById('hero_password').value
+                hero_password: document.getElementById('hero_password').value,
+                sms_provider: document.getElementById('sms_provider').value || 'hero-sms',
+                hero_api_key: (document.getElementById('hero_api_key').value || '').trim()
             };
 
             return fetch('/api/config', {
